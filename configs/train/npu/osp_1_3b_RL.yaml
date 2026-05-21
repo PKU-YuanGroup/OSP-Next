@@ -1,0 +1,91 @@
+cp_size: 4
+data_config:
+    batch_size: 1
+    collator_name: wan_t2v
+    dataset_config:
+        metafile_or_dir_path: /home/ma-user/work/data/osp-yuan/hq_videos_81f720p/filtered_samples_2572816.lmdb
+        return_prompt_mask: true
+        sample_height: 480
+        sample_num_frames: 81
+        sample_width: 832
+        text_drop_ratio: 0.1
+        text_tokenizer_path: /home/ma-user/work/gyy/ospnext/Wan2.1-T2V-1.3B/google/umt5-xxl
+        tokenizer_max_length: 512
+        train_fps: 16
+    dataset_name: wan_t2v
+    drop_last: true
+    num_workers: 16
+    pin_memory: false
+    sampler_name: stateful_distributed
+    shuffle: true
+ema_decay: 0.9993
+ema_update_interval: 1
+explicit_prefetching_num_blocks: 2
+fsdp_size: 8
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+init_max_grad_norm: 1.0
+log_interval: 1
+model_config:
+    dim: 1536
+    ffn_dim: 8960
+    freq_dim: 256
+    in_dim: 16
+    lock_main_parameters: false
+    num_full_blocks: 8
+    num_heads: 12
+    num_layers: 30
+    num_register_tokens: 0
+    out_dim: 16
+    pretrained_full_model_dir_or_checkpoint: /home/ma-user/work/gyy/ospnext/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors
+    pretrained_model_dir_or_checkpoint: /home/ma-user/work/gyy/ospnext/output/osp_next_1_3b_81f480p_sparse2d2_ssp2_training_with_full/iter_000010000/ema_model_state_dict.pt
+    skiparse_1d: false
+    skiparse_2d: true
+    skiparse_model_type: dual_end
+    sparse_ratio: 2
+    text_len: 512
+    training_with_full: true
+model_name: osp_next
+optimizer_config:
+    lr: 2.0e-04
+    weight_decay: 0.001
+output_dir: output/osp_next_1_3b_81f480p_sparse2d2_ssp2_training_with_full_grpo4_test_multinode
+profiling: false
+reshard_after_forward: false
+save_interval: 10
+save_with_dcp_api: true
+scheduler_config:
+    scheduler_name: flow_matching
+    shift: 7.5
+    use_logitnorm_time_sampling: true
+seed: 42
+skiparse_cp_size: 2
+text_encoder_config:
+    checkpoint_path: /home/ma-user/work/gyy/ospnext/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+    text_len: 512
+    use_fsdp: true
+training_iteration: 1000000
+use_context_parallel: false
+use_skiparse_context_parallel: true
+vae_config:
+    dtype: fp32
+    vae_path: /home/ma-user/work/gyy/ospnext/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+wandb_config:
+    exp_name: osp_next_1_3b_81f480p_sparse2d2_ssp2_training_with_full_GRPO
+    project_name: osp_next_GRPO
+weight_dtype: bf16
+
+
+rl_config:
+  prompt_file: "/home/ma-user/work/xianyi/osp_next/dataset/vbench/vbench_train.txt"
+  eval_prompt_file: "/home/ma-user/work/xianyi/osp_next/dataset/vbench/sora_test.txt"
+  sde_steps: 10
+  num_inference_steps: 25
+  kl_beta: 0.004
+  num_batches_per_epoch: 1
+  num_image_per_prompt: 4
+  sample_batch_size: 1
+  train_batch_size: 1
+  reward_fn: 
+    videoalign: 1.0
+  

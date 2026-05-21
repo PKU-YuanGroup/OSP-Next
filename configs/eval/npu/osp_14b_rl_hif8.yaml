@@ -1,0 +1,85 @@
+# test yaml
+
+model_name: "osp_next"
+pipeline_name: "t2v"
+seed: 666
+
+output_dir: "samples/vbench/osp_14b_grpo_hif8_step32_negative_2"
+# output_dir: "samples/vbench/osp_14b_grpo_bf16_step64"
+
+num_frames: 81
+height: 720
+width: 1280
+save_fps: 16
+batch_size: 1
+
+fsdp_size: 8
+cp_size: 2
+skiparse_cp_size: 4
+use_context_parallel: False
+use_skiparse_context_parallel: True
+reshard_after_forward: True
+explicit_prefetching_num_blocks: 0
+weight_dtype: "bf16"
+save_with_dcp_api: False
+
+model_config:
+  dim: 5120
+  ffn_dim: 13824
+  freq_dim: 256
+  in_dim: 16
+  num_heads: 40
+  num_layers: 40
+  out_dim: 16
+  text_len: 512
+  skiparse_model_type: "dual_end"
+  quant: "hif8"
+  quant_attn: "hif8"
+  scale_max_forward: 15.0    # forward activation scale clamp (HIF8 max ≈ 15)
+  scale_max_backward: 224.0  # backward gradient scale clamp  (HIF8 max ≈ 224)
+  sparse_ratio: 2
+  num_full_blocks: 8
+  num_register_tokens: 0
+  skiparse_1d: False
+  skiparse_2d: True
+  pretrained_model_dir_or_checkpoint: "/home/ma-user/work/gyy/ospnext/output/hif8/osp_next_14b_81f720p_sparse2d2_ssp4_from_full/iter_000006000/ema_model_state_dict.pt"
+
+# gyy/ospnext/output/hif8/osp_next_14b_81f720p_sparse2d2_ssp4_from_full/iter_000006000
+# /home/ma-user/work/gyy/ospnext/output/osp_next_14b_81f720p_sparse2d2_ssp4/iter_000006000/ema_model_state_dict.pt
+
+scheduler_config:
+  scheduler_name: "flow_matching"
+  num_inference_steps: 50
+  shift: 7.0
+  guidance_scale: 5.0
+
+vae_config:
+  vae_path: "/home/ma-user/work/gyy/ospnext/Wan2.1-T2V-14B/Wan2.1_VAE.pth"
+  dtype: "fp16"
+
+text_encoder_config:
+  text_len: 512
+  checkpoint_path: "/home/ma-user/work/gyy/ospnext/Wan2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth"
+  text_tokenizer_path: "/home/ma-user/work/gyy/ospnext/Wan2.1-T2V-14B/google/umt5-xxl"
+  use_fsdp: True
+
+data_config:
+  batch_size: 1
+  num_workers: 16
+  pin_memory: False
+  dataset_name: "t2v_eval"
+  dataset_config:
+    metafile_or_dir_path: "/home/ma-user/work/gyy/ospnext/eval/filtered_samples_946.lmdb"
+    text_tokenizer_path: "/home/ma-user/work/gyy/ospnext/Wan2.1-T2V-14B/google/umt5-xxl"
+    num_samples_per_prompt: 5
+    sample_height: 720
+    sample_width: 1280
+    sample_num_frames: 81
+    train_fps: 16
+    tokenizer_max_length: 512
+    return_prompt_mask: True
+  sampler_name: "stateful_distributed"
+  collator_name: "t2v_eval"
+
+  lora_path: /home/ma-user/work/xianyi/osp_next/ospnext/output/osp_next_14b_lr1e_5_81f720p_sparse2d2_sp2_ssp4_grpo4_node7_lr1e04_hif8_2/lora-checkpoint-32/adapter_model.bin
+  # lora_path: /home/ma-user/work/xianyi/osp_next/ospnext/output/osp_next_14b_lr1e_5_81f720p_sparse2d2_sp2_ssp4_grpo4_node7_lr1e04_bf16/lora-checkpoint-64/adapter_model.bin

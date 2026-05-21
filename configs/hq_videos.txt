@@ -1,0 +1,9 @@
+,/home/ma-user/work/data/osp-yuan/metadata/step2/sucai_final_3880570.json
+,/home/ma-user/work/data/osp-yuan/metadata/step2/istock_v1_final_321725.json
+,/home/ma-user/work/data/osp-yuan/metadata/step2/istock_v2_final_254054.json
+,/home/ma-user/work/data/osp-yuan/metadata/step2/istock_v4_final_1609738.json
+,/home/ma-user/work/data/osp-yuan/metadata/step2/movie_bbc01_final_300528.json
+,/home/ma-user/work/data/osp-yuan/metadata/step2/movie_bbc02_final_385967.json
+,/home/ma-user/work/data/osp-yuan/metadata/step2/movie_bbc03_final_1043580.json
+,/home/ma-user/work/data/osp-yuan/metadata/step2/movie_bbc04_final_413116.json
+,/home/ma-user/work/data/osp-yuan/metadata/step2/movie_bbc05_final_698107.json
