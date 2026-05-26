@@ -18,7 +18,7 @@ from ospnext.distributed.utils import (
     set_modules_to_forward_prefetch,
 )
 from ospnext.distributed.fsdp2_wrapper import FSDP2_mix_wrapper
-from ospnext.distributed.cp_state import cp_state
+from ospnext.distributed.sp_state import sp_state
 from ospnext.modules import (
     WanVAE, 
     T5EncoderModel, 
@@ -35,71 +35,6 @@ from ospnext.pipelines import pipelines
 from ospnext.utils.infer_utils import load_prompts, load_images, save_videos, save_video_grid
 from ospnext.utils.random_utils import set_seed
 
-def load_lora_and_merge(
-    model,
-    lora_path,
-    lora_rank=32,
-    lora_alpha=64,
-    lora_target_modules=None,
-    logger=None,
-    rank=0,
-):
-    """
-    Load LoRA weights from a manually saved adapter_model.bin, then merge into base model.
-    """
-    from peft import LoraConfig, get_peft_model
-    if lora_target_modules is None:
-        lora_target_modules = [
-            "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
-            "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
-        ]
-
-    if not os.path.isfile(lora_path):
-        raise ValueError(f"LoRA file not found: {lora_path}")
-
-    if logger is not None:
-        from ospnext.utils.log_utils import log_on_main_process
-        log_on_main_process(logger, f"Loading LoRA from {lora_path}")
-        log_on_main_process(logger, f"LoRA rank={lora_rank}, alpha={lora_alpha}")
-        log_on_main_process(logger, f"LoRA target_modules={lora_target_modules}")
-
-    peft_config = LoraConfig(
-        r=lora_rank,
-        lora_alpha=lora_alpha,
-        init_lora_weights="gaussian",
-        target_modules=lora_target_modules,
-    )
-
-    model = get_peft_model(model, peft_config)
-    model.set_adapter("default")
-
-    lora_sd = torch.load(lora_path, map_location="cpu")
-    missing, unexpected = model.load_state_dict(lora_sd, strict=False)
-
-    if rank == 0:
-        # 只打印缺失的 lora_ 键，基础模型的键缺失是正常的，因为 lora 权重里本来就只有 lora_ 相关的键
-        missing_lora = [k for k in missing if "lora_" in k]
-        if missing_lora:
-            print(f"[LoRA] missing lora keys: {len(missing_lora)}, example: {missing_lora[:5]}")
-        print(f"[LoRA] unexpected keys: {len(unexpected)}")
-
-    # sanity check
-    missing_lora = [k for k in missing if "lora_" in k]
-    if len(unexpected) > 0:
-        raise RuntimeError(f"LoRA load has unexpected keys, example: {unexpected[:20]}")
-    if len(missing_lora) > 0:
-        raise RuntimeError(f"LoRA load missing LoRA keys, example: {missing_lora[:20]}")
-
-    if logger is not None:
-        log_on_main_process(logger, "LoRA weights loaded successfully, merging into base model...")
-
-    model = model.merge_and_unload()
-
-    if logger is not None:
-        log_on_main_process(logger, "LoRA merged into base model successfully.")
-
-    return model
-
 def main(config):
     logger = get_logger()
 
@@ -112,10 +47,10 @@ def main(config):
     vae_config = config.get("vae_config", {})
     text_encoder_config = config.get("text_encoder_config", {})
     scheduler_config = config.get("scheduler_config", {})
-    # skiparse相关
+    # skiparse related
     sparse_ratio = model_config.get("sparse_ratio", 1)
-    skiparse_1d = model_config.get("skiparse_1d", False)
-    skiparse_2d = model_config.get("skiparse_2d", False)
+    skiparse_model_type = model_config.get("skiparse_model_type", "full")
+    is_skiparse_model = skiparse_model_type != "full"
     num_full_blocks = model_config.get("num_full_blocks", 0)
 
     # inference config
@@ -127,28 +62,14 @@ def main(config):
     height = config.get("height", 480)
     width = config.get("width", 832)
     save_fps = config.get("save_fps", 16)
-    use_context_parallel = config.get("use_context_parallel", False)
-    use_skiparse_context_parallel = config.get("use_skiparse_context_parallel", False)
+    use_sequence_parallel = config.get("use_sequence_parallel", False)
+    use_skiparse_sequence_parallel = config.get("use_skiparse_sequence_parallel", False)
     reshard_after_forward = config.get("reshard_after_forward", None)
     model_cpu_offload = config.get("model_cpu_offload", False)
     explicit_prefetching_num_blocks = config.get("explicit_prefetching_num_blocks", 0)
 
-    # LoRA config
-    lora_path = config.get("lora_path", None)
-    lora_rank = config.get("lora_rank", 32)
-    lora_alpha = config.get("lora_alpha", 64)
-    lora_target_modules = config.get(
-        "lora_target_modules",
-        [
-            "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
-            "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
-        ]
-    )
-
     # save config
     output_dir = config.get("output_dir", "./output")
-    save_with_dcp_api = config.get("save_with_dcp_api", False)
-
     # distributed setup
     setup_distributed_env()
     
@@ -168,39 +89,35 @@ def main(config):
     logger.info(f"rank {rank} use ddp mesh {ddp_fsdp_mesh['ddp']} and fsdp mesh {ddp_fsdp_mesh['fsdp']}")
 
     dp_group = dist.group.WORLD # use default world group
-    # init cp mesh if use context parallel
-    cp_size = 1
-    use_context_parallel = use_context_parallel and config.get("cp_size", 1) > 1
-    # skiparse cp
-    skiparse_cp_size = 1
-    use_skiparse_context_parallel = use_skiparse_context_parallel and config.get("skiparse_cp_size", 1) > 1 and sparse_ratio > 1
-    use_global_context_parallel = use_context_parallel or use_skiparse_context_parallel
-    global_cp_size = 1
-    # full cp size
-    # 用于混合full attn blocks和skiparse blocks时对于full blocks采用的cp group
-    full_cp_size = 1
-    use_full_blocks_context_parallel = use_global_context_parallel and (skiparse_1d or skiparse_2d) and num_full_blocks > 0
-    # use_full_blocks_context_parallel = False
-    if use_global_context_parallel:
-        if use_context_parallel:
-            cp_size = config.get("cp_size", 1)
-        if use_skiparse_context_parallel:
-            skiparse_cp_size = config.get("skiparse_cp_size", 1)
-            if skiparse_1d:
-                assert skiparse_cp_size <= sparse_ratio and sparse_ratio % skiparse_cp_size == 0
-            elif skiparse_2d:
-                assert skiparse_cp_size <= sparse_ratio ** 2 and (sparse_ratio ** 2) % skiparse_cp_size == 0
-        global_cp_size = skiparse_cp_size * cp_size
-        # dp * skiparse_cp * cp = world_size
-        # 先skiparse_cp后cp，因为skiparse_cp的通信量更小
-        dp_global_cp_mesh = init_device_mesh("cuda", (world_size // global_cp_size, skiparse_cp_size, cp_size), mesh_dim_names=("dp", "skiparse_cp", "cp"))
-        dp_group = dp_global_cp_mesh["dp"].get_group()
-        global_cp_group = dp_global_cp_mesh["skiparse_cp", "cp"]._flatten().get_group()
-        skiparse_cp_group = dp_global_cp_mesh["skiparse_cp"].get_group()
-        # 初始化的时候full_blocks_cp_group和cp_group是同一个group
-        full_cp_group = cp_group = dp_global_cp_mesh["cp"].get_group()
-        log_on_main_process(logger, f"We use context parrallel, global_cp_size: {global_cp_size}, cp_size: {cp_size}, skiparse_cp_size: {skiparse_cp_size}")
-        cp_state.reset(global_cp_group=global_cp_group, cp_group=cp_group, skiparse_cp_group=skiparse_cp_group, full_cp_group=full_cp_group)
+    # init sp mesh if use sequence parallel
+    sp_size = 1
+    use_sequence_parallel = use_sequence_parallel and config.get("sp_size", 1) > 1
+    # skiparse sp
+    skiparse_sp_size = 1
+    use_skiparse_sequence_parallel = use_skiparse_sequence_parallel and config.get("skiparse_sp_size", 1) > 1 and sparse_ratio > 1
+    use_global_sequence_parallel = use_sequence_parallel or use_skiparse_sequence_parallel
+    global_sp_size = 1
+    # full sp size
+    full_sp_size = 1
+    use_full_blocks_sequence_parallel = use_global_sequence_parallel and is_skiparse_model and num_full_blocks > 0
+    if use_global_sequence_parallel:
+        if use_sequence_parallel:
+            sp_size = config.get("sp_size", 1)
+        if use_skiparse_sequence_parallel:
+            skiparse_sp_size = config.get("skiparse_sp_size", 1)
+            if is_skiparse_model:
+                # OSP-Next skiparse is 2D, so the per-rank shard must evenly divide sparse_ratio ** 2.
+                assert skiparse_sp_size <= sparse_ratio ** 2 and (sparse_ratio ** 2) % skiparse_sp_size == 0
+        global_sp_size = skiparse_sp_size * sp_size
+        # dp * skiparse_sp * sp = world_size
+        dp_global_sp_mesh = init_device_mesh("cuda", (world_size // global_sp_size, skiparse_sp_size, sp_size), mesh_dim_names=("dp", "skiparse_sp", "sp"))
+        dp_group = dp_global_sp_mesh["dp"].get_group()
+        global_sp_group = dp_global_sp_mesh["skiparse_sp", "sp"]._flatten().get_group()
+        skiparse_sp_group = dp_global_sp_mesh["skiparse_sp"].get_group()
+        # when initializing, full_blocks_sp_group and sp_group are the same group
+        full_sp_group = sp_group = dp_global_sp_mesh["sp"].get_group()
+        log_on_main_process(logger, f"We use sequence parallel, global_sp_size: {global_sp_size}, sp_size: {sp_size}, skiparse_sp_size: {skiparse_sp_size}")
+        sp_state.reset(global_sp_group=global_sp_group, sp_group=sp_group, skiparse_sp_group=skiparse_sp_group, full_sp_group=full_sp_group)
 
     if rank == 0:
         os.makedirs(output_dir, exist_ok=True)
@@ -244,58 +161,21 @@ def main(config):
     else:
         raise ValueError(f"In inference mode, pretrained_model_dir_or_checkpoint {pretrained_model_dir_or_checkpoint} must be specified!")
 
-    if use_context_parallel or use_full_blocks_context_parallel:
-        if use_context_parallel and model.num_heads % cp_size != 0:
-            raise ValueError(f"When using context parallel, num_heads {model.num_heads} mush be mutiple of cp_size {cp_size}!")
-        if use_full_blocks_context_parallel:
-            if global_cp_size <= model.num_heads and model.num_heads % global_cp_size == 0:
-                full_cp_size = global_cp_size
-            # 找到model.num_heads与global_cp_size的最大公约数
+    if use_sequence_parallel or use_full_blocks_sequence_parallel:
+        if use_sequence_parallel and model.num_heads % sp_size != 0:
+            raise ValueError(f"When using sequence parallel, num_heads {model.num_heads} mush be mutiple of sp_size {sp_size}!")
+        if use_full_blocks_sequence_parallel:
+            if global_sp_size <= model.num_heads and model.num_heads % global_sp_size == 0:
+                full_sp_size = global_sp_size
+            # find the greatest common divisor of model.num_heads and global_sp_size
             else:
-                gcd = math.gcd(model.num_heads, global_cp_size)
-                full_cp_size = gcd
-            # full_cp_size一定是global_cp_size的约数，而global_cp_size一定是world_size的约数
-            # 所以full_cp_group一定是global_cp_group的子集
-            dummy_mesh = init_device_mesh("cuda", (world_size // full_cp_size, full_cp_size), mesh_dim_names=("dummy", "full_cp"))
-            full_cp_group = dummy_mesh["full_cp"].get_group()
-            cp_state.reset(full_cp_group=full_cp_group)
+                gcd = math.gcd(model.num_heads, global_sp_size)
+                full_sp_size = gcd
+            dummy_mesh = init_device_mesh("cuda", (world_size // full_sp_size, full_sp_size), mesh_dim_names=("dummy", "full_sp"))
+            full_sp_group = dummy_mesh["full_sp"].get_group()
+            sp_state.reset(full_sp_group=full_sp_group)
     
     model.eval()
-
-    # if model was initialized on meta, materialize and load base checkpoint first
-    if not has_loaded_pretrained_model:
-        model.to_empty(device=device)
-        set_seed(seed, device_specific=False) # for init
-        model.reset_parameters() # we should call reset_parameters because we init model at meta device 
-
-    if pretrained_model_dir_or_checkpoint is not None and os.path.isfile(pretrained_model_dir_or_checkpoint):
-        log_on_main_process(logger, f"Load model from pretrained_model_checkpoint {pretrained_model_dir_or_checkpoint}")
-        if pretrained_model_dir_or_checkpoint.endswith(".safetensors"):
-            from safetensors.torch import load_file as safe_load
-            full_sd = safe_load(pretrained_model_dir_or_checkpoint, device="cpu")
-        else:
-            full_sd = torch.load(pretrained_model_dir_or_checkpoint, mmap=True, weights_only=True, map_location="cpu")
-        
-        # Load directly into the un-wrapped model, matching the behavior in train_osp_RL_lora.py
-        missing_keys, unexpected_keys = model.load_state_dict(full_sd, strict=False)
-        if rank == 0:
-            if missing_keys:
-                print(f"[Base model checkpoint] missing_keys: {missing_keys[:20]}...")
-            if unexpected_keys:
-                print(f"[Base model checkpoint] unexpected_keys: {unexpected_keys[:20]}...")
-        del full_sd
-        has_loaded_pretrained_model = True
-
-    if lora_path is not None:
-        model = load_lora_and_merge(
-            model=model,
-            lora_path=lora_path,
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_target_modules=lora_target_modules,
-            logger=logger,
-            rank=rank,
-        )
 
     # wrap model with fsdp2 mix-precision wrapper
     FSDP2_mix_wrapper(
@@ -309,11 +189,11 @@ def main(config):
         cpu_offload=model_cpu_offload,
     )
 
-
-    if not has_loaded_pretrained_model:
-        model.to_empty(device=device)
-        set_seed(seed, device_specific=False) # for init
-        model.reset_parameters() # we should call reset_parameters because we init model at meta device 
+    if not has_loaded_pretrained_model and pretrained_model_dir_or_checkpoint is not None and os.path.isfile(pretrained_model_dir_or_checkpoint):
+        checkpointer = Checkpointer()
+        checkpointer.load_model_from_path(model, pretrained_model_dir_or_checkpoint)
+    else:
+        raise ValueError(f"In inference mode, pretrained_model_dir_or_checkpoint {pretrained_model_dir_or_checkpoint} must be specified!")
 
     if explicit_prefetching_num_blocks > 0:
         set_modules_to_forward_prefetch(model.blocks, num_to_forward_prefetch=explicit_prefetching_num_blocks)
@@ -334,9 +214,9 @@ def main(config):
 
     dp_rank = torch.distributed.get_rank(dp_group)
     dp_size = torch.distributed.get_world_size(dp_group)
-    cp_rank = cp_state.global_cp_rank
-    cp_size = cp_state.global_cp_size
-    cp_group = cp_state.global_cp_group
+    sp_rank = sp_state.global_sp_rank
+    sp_size = sp_state.global_sp_size
+    sp_group = sp_state.global_sp_group
 
     if len(prompts) % dp_size > 0:
         log_on_main_process(logger, f"Warning! Caused by using FSDP, we will pad some dummy data to make sure len(prompts) {len(prompts)} == dp_size {dp_size}.")
@@ -355,7 +235,7 @@ def main(config):
             max_sequence_length=512,
             device=device
         )
-        if cp_rank == 0:
+        if sp_rank == 0:
             save_videos(videos, index, output_dir, save_fps)
             video_grid.append(videos)
 
@@ -367,7 +247,7 @@ def main(config):
     else:
         active_ranks = range(dp_size)
 
-    active_ranks = [x * cp_size for x in active_ranks]
+    active_ranks = [x * sp_size for x in active_ranks]
     # torch.distributed.barrier()
     gathered_videos = gather_tensor_list_to_one([video_grid], group_dst=0, active_ranks=active_ranks)
     # torch.distributed.barrier()

@@ -18,7 +18,7 @@ from argparse import ArgumentParser
 from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from ospnext.data import ultra_datasets, ultra_samplers, ultra_collators
+from ospnext.data import ospnext_datasets, ospnext_samplers, ospnext_collators
 from ospnext.data.utils.utils import cyclic_iter
 from ospnext.utils.log_utils import get_logger, log_on_main_process, verify_min_gpu_count
 from ospnext.utils.random_utils import set_seed
@@ -31,7 +31,7 @@ from ospnext.distributed.utils import (
 )
 from ospnext.distributed.fsdp2_wrapper import FSDP2_mix_wrapper
 from ospnext.distributed.fsdp_ema import FSDPEMAModel as EMAModel
-from ospnext.distributed.cp_state import cp_state
+from ospnext.distributed.sp_state import sp_state
 
 from ospnext.modules import (
     WanVAE, 
@@ -62,10 +62,10 @@ def main(config):
     vae_config = config.get("vae_config", {})
     text_encoder_config = config.get("text_encoder_config", {})
     scheduler_config = config.get("scheduler_config", {})
-    # skiparse相关
+    # skiparse related
     sparse_ratio = model_config.get("sparse_ratio", 1)
-    skiparse_1d = model_config.get("skiparse_1d", False)
-    skiparse_2d = model_config.get("skiparse_2d", False)
+    skiparse_model_type = model_config.get("skiparse_model_type", "full")
+    is_skiparse_model = skiparse_model_type != "full"
     num_full_blocks = model_config.get("num_full_blocks", 0)
     lock_main_parameters = model_config.get("lock_main_parameters", False)
     training_with_full = model_config.get("training_with_full", False)
@@ -90,8 +90,8 @@ def main(config):
     ema_decay = config.get("ema_decay", 0.9999)
     ema_update_interval = config.get("ema_update_interval", 1)
     explicit_prefetching_num_blocks = config.get("explicit_prefetching_num_blocks", 0)
-    use_context_parallel = config.get("use_context_parallel", False)
-    use_skiparse_context_parallel = config.get("use_skiparse_context_parallel", False)
+    use_sequence_parallel = config.get("use_sequence_parallel", False)
+    use_skiparse_sequence_parallel = config.get("use_skiparse_sequence_parallel", False)
     deterministic_training = config.get("deterministic_training", False)
     profiling = config.get("profiling", False)
 
@@ -132,46 +132,42 @@ def main(config):
     logger.info(f"rank {rank} use ddp mesh {ddp_fsdp_mesh['ddp']} and fsdp mesh {ddp_fsdp_mesh['fsdp']}")
 
     dp_group = dist.group.WORLD # use default world group
-    # init cp mesh if use context parallel
-    cp_size = 1
-    use_context_parallel = use_context_parallel and config.get("cp_size", 1) > 1
-    # skiparse cp
-    skiparse_cp_size = 1
-    use_skiparse_context_parallel = use_skiparse_context_parallel and config.get("skiparse_cp_size", 1) > 1 and sparse_ratio > 1
-    use_global_context_parallel = use_context_parallel or use_skiparse_context_parallel
-    global_cp_size = 1
-    # full cp size
-    # 用于混合full attn blocks和skiparse blocks时对于full blocks采用的cp group
-    full_cp_size = 1
-    use_full_blocks_context_parallel = use_global_context_parallel and (skiparse_1d or skiparse_2d) and num_full_blocks > 0
-    # use_full_blocks_context_parallel = False
-    if use_global_context_parallel:
-        if use_context_parallel:
-            cp_size = config.get("cp_size", 1)
-        if use_skiparse_context_parallel:
-            skiparse_cp_size = config.get("skiparse_cp_size", 1)
-            if skiparse_1d:
-                assert skiparse_cp_size <= sparse_ratio and sparse_ratio % skiparse_cp_size == 0
-            elif skiparse_2d:
-                assert skiparse_cp_size <= sparse_ratio ** 2 and (sparse_ratio ** 2) % skiparse_cp_size == 0
-        global_cp_size = skiparse_cp_size * cp_size
-        # dp * skiparse_cp * cp = world_size
-        # 先skiparse_cp后cp，因为skiparse_cp的通信量更小
-        dp_global_cp_mesh = init_device_mesh("cuda", (world_size // global_cp_size, skiparse_cp_size, cp_size), mesh_dim_names=("dp", "skiparse_cp", "cp"))
-        dp_group = dp_global_cp_mesh["dp"].get_group()
-        global_cp_group = dp_global_cp_mesh["skiparse_cp", "cp"]._flatten().get_group()
-        skiparse_cp_group = dp_global_cp_mesh["skiparse_cp"].get_group()
-        # 初始化的时候full_blocks_cp_group和cp_group是同一个group
-        full_cp_group = cp_group = dp_global_cp_mesh["cp"].get_group()
-        log_on_main_process(logger, f"We use context parrallel, global_cp_size: {global_cp_size}, cp_size: {cp_size}, skiparse_cp_size: {skiparse_cp_size}")
-        cp_state.reset(global_cp_group=global_cp_group, cp_group=cp_group, skiparse_cp_group=skiparse_cp_group, full_cp_group=full_cp_group)
+    # init sp mesh if use sequence parallel
+    sp_size = 1
+    use_sequence_parallel = use_sequence_parallel and config.get("sp_size", 1) > 1
+    # skiparse sp
+    skiparse_sp_size = 1
+    use_skiparse_sequence_parallel = use_skiparse_sequence_parallel and config.get("skiparse_sp_size", 1) > 1 and sparse_ratio > 1
+    use_global_sequence_parallel = use_sequence_parallel or use_skiparse_sequence_parallel
+    global_sp_size = 1
+    # full sp size
+    full_sp_size = 1
+    use_full_blocks_sequence_parallel = use_global_sequence_parallel and is_skiparse_model and num_full_blocks > 0
+    if use_global_sequence_parallel:
+        if use_sequence_parallel:
+            sp_size = config.get("sp_size", 1)
+        if use_skiparse_sequence_parallel:
+            skiparse_sp_size = config.get("skiparse_sp_size", 1)
+            if is_skiparse_model:
+                # OSP-Next skiparse is 2D, so the per-rank shard must evenly divide sparse_ratio ** 2.
+                assert skiparse_sp_size <= sparse_ratio ** 2 and (sparse_ratio ** 2) % skiparse_sp_size == 0
+        global_sp_size = skiparse_sp_size * sp_size
+        # dp * skiparse_sp * sp = world_size
+        dp_global_sp_mesh = init_device_mesh("cuda", (world_size // global_sp_size, skiparse_sp_size, sp_size), mesh_dim_names=("dp", "skiparse_sp", "sp"))
+        dp_group = dp_global_sp_mesh["dp"].get_group()
+        global_sp_group = dp_global_sp_mesh["skiparse_sp", "sp"]._flatten().get_group()
+        skiparse_sp_group = dp_global_sp_mesh["skiparse_sp"].get_group()
+        # when initializing, full_blocks_sp_group and sp_group are the same group
+        full_sp_group = sp_group = dp_global_sp_mesh["sp"].get_group()
+        log_on_main_process(logger, f"We use sequence parallel, global_sp_size: {global_sp_size}, sp_size: {sp_size}, skiparse_sp_size: {skiparse_sp_size}")
+        sp_state.reset(global_sp_group=global_sp_group, sp_group=sp_group, skiparse_sp_group=skiparse_sp_group, full_sp_group=full_sp_group)
 
-    print(f"use_global_context_parallel: {use_global_context_parallel}, use_context_parallel: {use_context_parallel}, use_skiparse_context_parallel: {use_skiparse_context_parallel}, use_full_blocks_context_parallel: {use_full_blocks_context_parallel}")
+    print(f"use_global_sequence_parallel: {use_global_sequence_parallel}, use_sequence_parallel: {use_sequence_parallel}, use_skiparse_sequence_parallel: {use_skiparse_sequence_parallel}, use_full_blocks_sequence_parallel: {use_full_blocks_sequence_parallel}")
 
-    if (save_interval * gradient_accumulation_steps) % global_cp_size != 0:
+    if (save_interval * gradient_accumulation_steps) % global_sp_size != 0:
         raise ValueError(
-            f"""because we use context parallel and encoder cache,
-            save_interval * gradient_accumulation_steps ({save_interval} * {gradient_accumulation_steps} = {save_interval * gradient_accumulation_steps}) must be multiple of global_cp_size {global_cp_size}!
+            f"""because we use sequence parallel and encoder cache,
+            save_interval * gradient_accumulation_steps ({save_interval} * {gradient_accumulation_steps} = {save_interval * gradient_accumulation_steps}) must be multiple of global_sp_size {global_sp_size}!
             """
         )
 
@@ -192,7 +188,7 @@ def main(config):
 
 
     log_on_main_process(logger, f"Initializing text encoder model with dtype: {weight_dtype} ...")
-    # text_encoder的shard ranks数量默认为8
+    # the number of shard ranks for text_encoder is 8 by default
     text_encoder_device_mesh = None
     if text_encoder_config.get("use_fsdp", False):
         num_replicate = max(world_size // 8, 1)
@@ -235,21 +231,21 @@ def main(config):
         with torch.device("meta"):
             model = models[model_name](**model_config)
 
-    if use_context_parallel or use_full_blocks_context_parallel:
-        if use_context_parallel and model.num_heads % cp_size != 0:
-            raise ValueError(f"When using context parallel, num_heads {model.num_heads} mush be mutiple of cp_size {cp_size}!")
-        if use_full_blocks_context_parallel:
-            if global_cp_size <= model.num_heads and model.num_heads % global_cp_size == 0:
-                full_cp_size = global_cp_size
-            # 找到model.num_heads与global_cp_size的最大公约数
+    if use_sequence_parallel or use_full_blocks_sequence_parallel:
+        if use_sequence_parallel and model.num_heads % sp_size != 0:
+            raise ValueError(f"When using sequence parallel, num_heads {model.num_heads} mush be mutiple of sp_size {sp_size}!")
+        if use_full_blocks_sequence_parallel:
+            if global_sp_size <= model.num_heads and model.num_heads % global_sp_size == 0:
+                full_sp_size = global_sp_size
+            # find the greatest common divisor of model.num_heads and global_sp_size
             else:
-                gcd = math.gcd(model.num_heads, global_cp_size)
-                full_cp_size = gcd
-            # full_cp_size一定是global_cp_size的约数，而global_cp_size一定是world_size的约数
-            # 所以full_cp_group一定是global_cp_group的子集
-            dummy_mesh = init_device_mesh("cuda", (world_size // full_cp_size, full_cp_size), mesh_dim_names=("dummy", "full_cp"))
-            full_cp_group = dummy_mesh["full_cp"].get_group()
-            cp_state.reset(full_cp_group=full_cp_group)
+                gcd = math.gcd(model.num_heads, global_sp_size)
+                full_sp_size = gcd
+            # full_sp_size is a divisor of global_sp_size, and global_sp_size is a divisor of world_size
+            # so full_sp_group is a subset of global_sp_group
+            dummy_mesh = init_device_mesh("cuda", (world_size // full_sp_size, full_sp_size), mesh_dim_names=("dummy", "full_sp"))
+            full_sp_group = dummy_mesh["full_sp"].get_group()
+            sp_state.reset(full_sp_group=full_sp_group)
 
     model.train()
 
@@ -308,40 +304,6 @@ def main(config):
     if not has_loaded_pretrained_model:
         log_on_main_process(logger, f"warning! now we train from scratch, please make sure pretrained_model_dir_or_checkpoint={pretrained_model_dir_or_checkpoint} is correct!")
 
-    if training_with_full:
-        pretrained_full_model_dir_or_checkpoint = model_config.get("pretrained_full_model_dir_or_checkpoint", None)
-        if pretrained_full_model_dir_or_checkpoint is None or not os.path.exists(pretrained_full_model_dir_or_checkpoint):
-            raise ValueError(f"Training with full attn model, but pretrained_full_model_dir_or_checkpoint {pretrained_full_model_dir_or_checkpoint} not found!")
-        full_model_config = deepcopy(model_config)
-        full_model_config["skiparse_model_type"] = "full"
-        full_model_config["num_register_tokens"] = 0
-        with torch.device("meta"):
-            full_model = models[model_name](**full_model_config)
-        has_loaded_pretrained_full_model = False
-        if os.path.isdir(pretrained_full_model_dir_or_checkpoint):
-            log_on_main_process(logger, f"Load full attn model from pretrained_full_model_dir {pretrained_full_model_dir_or_checkpoint}")
-            full_model = models[model_name].from_pretrained(pretrained_full_model_dir_or_checkpoint)
-            has_loaded_pretrained_full_model = True
-            if model_cpu_offload:
-                log_on_main_process(logger, "Moving pretrained full model to CPU for FSDP CPU offloading...")
-                full_model.to("cpu")
-        full_model.requires_grad_(False)
-        full_model.eval()
-        FSDP2_mix_wrapper(
-            full_model,
-            dp_mesh=ddp_fsdp_mesh,
-            weight_dtype=weight_dtype,
-            main_block_to_half=models_main_block[model_name],
-            blocks_to_float=models_blocks_to_float[model_name],
-            blocks_to_output_float=models_blocks_to_output_float[model_name],
-            reshard_after_forward=reshard_after_forward,
-            cpu_offload=model_cpu_offload,
-        )
-        if not has_loaded_pretrained_full_model and not os.path.isdir(pretrained_full_model_dir_or_checkpoint):
-            log_on_main_process(logger, f"Load full attn model from pretrained_full_model_checkpoint {pretrained_full_model_dir_or_checkpoint}")
-            checkpointer.load_model_from_path(full_model, pretrained_full_model_dir_or_checkpoint)
-            has_loaded_pretrained_full_model = True
-
     log_on_main_process(logger, "Initializing and loading optimizer checkpoint...")
     learning_rate = optimizer_config.get("lr", 1e-4)
     weight_decay = optimizer_config.get("weight_decay", 1e-2)
@@ -366,23 +328,23 @@ def main(config):
     
     log_on_main_process(logger, "Initializing dataset, sampler and dataloader...")
     # dataset
-    dataset = ultra_datasets[data_config.get("dataset_name", "t2v_random")](**data_config.get("dataset_config", {}))
+    dataset = ospnext_datasets[data_config.get("dataset_name", "t2v_random")](**data_config.get("dataset_config", {}))
     
     # sampler
     batch_size = data_config.get("batch_size", 1)
     dp_size = dp_group.size() 
-    sampler = ultra_samplers[data_config.get("sampler_name", "stateful_distributed")](
+    sampler = ospnext_samplers[data_config.get("sampler_name", "stateful_distributed")](
         dataset, 
         num_replicas=dist.get_world_size(), # we use encoder cache, so num_replicas = world_size
         rank=dist.get_rank(), # we use encoder cache, so rank in dp_group is same as global rank
         shuffle=data_config.get("shuffle", True),
         # consumed_samples=consumed_samples,
         drop_last=data_config.get("drop_last", True),
-        seed=seed, # 所有rank都用相同的seed传给sampler，sampler会先用该seed对序列random，然后再切分到rank
+        seed=seed, # all ranks use the same seed to pass to sampler, sampler will first random the sequence with this seed, then split to ranks
     )
     # dataloader
     num_workers = data_config.get("num_workers", 16)
-    collator = ultra_collators[data_config.get("collator_name", "wan_t2v")](**data_config.get("collator_config", {}))
+    collator = ospnext_collators[data_config.get("collator_name", "wan_t2v")](**data_config.get("collator_config", {}))
     dataloader = StatefulDataLoader(
         dataset,
         batch_size=batch_size,
@@ -397,7 +359,7 @@ def main(config):
         log_on_main_process(logger, "Loading dataloader state...")
         checkpointer.load_dataloader_state_dict(dataloader)
 
-    encoder_cache_manager = EncoderCacheManager(tp_cp_group=global_cp_group if use_global_context_parallel else None)
+    encoder_cache_manager = EncoderCacheManager(tp_sp_group=global_sp_group if use_global_sequence_parallel else None)
 
     trainable_params_before_sharding = trainable_params_after_sharding = 0
     locked_params_before_sharding = locked_params_after_sharding = 0
@@ -422,20 +384,19 @@ def main(config):
     Model has {params_nums_to_str(trainable_params_before_sharding)} trainable parameters and {params_nums_to_str(locked_params_before_sharding)} locked parameters
     After FSDP sharding,
     Model has {params_nums_to_str(trainable_params_after_sharding)} trainable parameters and {params_nums_to_str(locked_params_after_sharding)} locked parameters
-    Training with Full Attn Model: {training_with_full}
     Scheduler: {scheduler_config.get("scheduler_name", "flow_matching")}
     Dataset: {data_config.get("dataset_name", "t2v_random")}
     Sampler: {data_config.get("sampler_name", "stateful_distributed")}
     Collator: {data_config.get("collator_name", "wan_t2v")}
     Use Encoder Cache Manager: {encoder_cache_manager.use_cache()}
-    Use Context Parallel: {use_context_parallel}
-    Use Skiparse Context Parallel: {use_skiparse_context_parallel}
-    Use Full Blocks Context Parallel: {use_full_blocks_context_parallel}
+    Use Sequence Parallel: {use_sequence_parallel}
+    Use Skiparse Sequence Parallel: {use_skiparse_sequence_parallel}
+    Use Full Blocks Sequence Parallel: {use_full_blocks_sequence_parallel}
     world_size: {world_size} GPUs
     dp_size: {dp_size} GPUs
-    cp_size: {cp_size} GPUs
-    skiparse_cp_size: {skiparse_cp_size} GPUs
-    global_cp_size: {global_cp_size} GPUs
+    sp_size: {sp_size} GPUs
+    skiparse_sp_size: {skiparse_sp_size} GPUs
+    global_sp_size: {global_sp_size} GPUs
     Gradient checkpointing: {gradient_checkpointing}
     Weight dtype: {weight_dtype}
     Reshard after forward: {reshard_after_forward}
@@ -466,7 +427,7 @@ def main(config):
         checkpointer.load_rng_state_dict()
 
     while current_iteration < training_iteration:
-        if current_batch_nums % global_cp_size == 0:
+        if current_batch_nums % global_sp_size == 0:
             if encoder_cpu_offload:
                 vae.model.to(device)
                 if not text_encoder_use_fsdp:
@@ -507,12 +468,11 @@ def main(config):
         sigmas = q_sample_results["sigmas"]
         timesteps = q_sample_results["timesteps"]
 
-        # cp组内同步，防止在同一个cp组里有不同的latents, prior_dist, sigmas, timesteps
-        if use_global_context_parallel:
-            torch.distributed.broadcast(interpolated_latents, group_src=0, group=global_cp_group)
-            torch.distributed.broadcast(prior_dist, group_src=0, group=global_cp_group)
-            torch.distributed.broadcast(sigmas, group_src=0, group=global_cp_group)
-            torch.distributed.broadcast(timesteps, group_src=0, group=global_cp_group)
+        if use_global_sequence_parallel:
+            torch.distributed.broadcast(interpolated_latents, group_src=0, group=global_sp_group)
+            torch.distributed.broadcast(prior_dist, group_src=0, group=global_sp_group)
+            torch.distributed.broadcast(sigmas, group_src=0, group=global_sp_group)
+            torch.distributed.broadcast(timesteps, group_src=0, group=global_sp_group)
 
         with torch.autocast("cuda", dtype=weight_dtype):
             if profiling and current_iteration >= 5:
@@ -545,19 +505,8 @@ def main(config):
                     text_embeddings,
                     start_frame_latents=start_frame_latents,
                 )
-                if training_with_full:
-                    full_model_output = full_model(
-                        interpolated_latents,
-                        timesteps,
-                        text_embeddings,
-                        start_frame_latents=start_frame_latents,
-                    )
 
-        if training_with_full:
-            # 最小化V_full和V_sparse
-            loss = torch.nn.functional.mse_loss(model_output.float(), full_model_output.float(), reduction='mean')
-        else:
-            loss = scheduler.training_losses(model_output, latents, prior_dist)[0]
+        loss = scheduler.training_losses(model_output, latents, prior_dist)[0]
         loss = loss / gradient_accumulation_steps # default value of gradient_accumulation_steps is 1
         loss.backward()
         loss_for_log = loss.clone().detach().unsqueeze(0)
@@ -577,7 +526,7 @@ def main(config):
                     "loss": gathered_avg_loss,
                     "lr": optimizer.param_groups[0]['lr'],
                     "grad_norm": grad_norm_after_clip.item()
-                }, refresh=False)  # 不立即刷新
+                }, refresh=False)  # do not refresh immediately
                 tqdm_bar.update(log_interval)
                 if rank == 0 and wandb.run is not None:
                     wandb_logs = {

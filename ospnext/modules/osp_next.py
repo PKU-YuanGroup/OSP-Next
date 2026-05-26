@@ -9,7 +9,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from abc import ABC, abstractmethod
 from einops import rearrange
 
-from ospnext.distributed.cp_state import cp_state, use_context_parallel, use_skiparse_context_parallel, use_full_blocks_context_parallel
+from ospnext.distributed.sp_state import sp_state, use_sequence_parallel, use_skiparse_sequence_parallel, use_full_blocks_sequence_parallel
 from ospnext.distributed.communication import all_gather, all_to_all_4D, all_to_all_single, get_shard_seq_lens
 from ospnext.utils.utils import is_npu_available, safe_get_rank, contiguous, SafeCacheManager
 from ospnext.utils.compile import maybe_compile
@@ -26,14 +26,14 @@ from .skiparse_func import (
     identity,
     repeat,
     reduce,
-    skiparse_2d_single,
-    skiparse_2d_single_reverse,
+    skiparse_2d_token,
+    skiparse_2d_token_reverse,
     skiparse_2d_group,
     skiparse_2d_group_reverse,
-    skiparse_2d_single_to_group,
-    skiparse_2d_group_to_single,
-    parallel_skiparse_2d_single_to_group,
-    parallel_skiparse_2d_group_to_single,
+    skiparse_2d_token_to_group,
+    skiparse_2d_group_to_token,
+    parallel_skiparse_2d_token_to_group,
+    parallel_skiparse_2d_group_to_token,
 )
 
 from .hif8_linear import HIF8Linear
@@ -59,7 +59,7 @@ def _make_linear(
 
 T5_CONTEXT_TOKEN_NUMBER = 512
 
-# 用实数rope，npu支持更好
+# real dtype rope, better supported on npu
 @torch.autocast("cuda", enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
@@ -69,11 +69,11 @@ def rope_params(max_seq_len, dim, theta=10000):
     )
     return freqs.float()  # (max_seq_len, dim//2)
 
-class ContextParallelType:
-    CP = "cp"
-    SkiparseCP = "skiparse_cp"
-    FullBlocksCP = "full_blocks_cp"
-    GlobalCP = "global_cp"
+class SequenceParallelType:
+    SP = "sp"
+    SkiparseSP = "skiparse_sp"
+    FullBlocksSP = "full_blocks_sp"
+    GlobalSP = "global_sp"
 
 class SkiparseModelType:
     DualEnd = "dual_end"
@@ -82,7 +82,7 @@ class SkiparseModelType:
 
 class SkiparseBlockType:
     Full = "full"
-    Single = "single"
+    Token = "token"
     Group = "group"
 
 class RearrangeType:
@@ -91,68 +91,66 @@ class RearrangeType:
     Repeat = "repeat"
     Reduce = "reduce"
 
-    Skiparse2DSingle = "skiparse_2d_single"
-    Skiparse2DSingleReverse = "skiparse_2d_single_reverse"
+    Skiparse2DToken = "skiparse_2d_token"
+    Skiparse2DTokenReverse = "skiparse_2d_token_reverse"
     Skiparse2DGroup = "skiparse_2d_group"
     Skiparse2DGroupReverse = "skiparse_2d_group_reverse"
-    Skiparse2DSingle2Group = "skiparse_2d_single_to_group"
-    Skiparse2DGroup2Single = "skiparse_2d_group_to_single"
+    Skiparse2DToken2Group = "skiparse_2d_token_to_group"
+    Skiparse2DGroup2Token = "skiparse_2d_group_to_token"
 
     @classmethod
     def input_is_full(cls, rearrange_type):
         return rearrange_type in [
-            cls.Skiparse2DSingle,
+            cls.Skiparse2DToken,
             cls.Skiparse2DGroup,
         ]
 
     @classmethod
     def input_is_skiparse_2d(cls, rearrange_type):
         return rearrange_type in [
-            cls.Skiparse2DSingleReverse,
+            cls.Skiparse2DTokenReverse,
             cls.Skiparse2DGroupReverse,
-            cls.Skiparse2DSingle2Group,
-            cls.Skiparse2DGroup2Single,
+            cls.Skiparse2DToken2Group,
+            cls.Skiparse2DGroup2Token,
         ]
     
     @classmethod
     def output_is_full(cls, rearrange_type):
         return rearrange_type in [
-            cls.Skiparse2DSingleReverse,
+            cls.Skiparse2DTokenReverse,
             cls.Skiparse2DGroupReverse,
         ]
-
 
     @classmethod
     def output_is_skiparse_2d(cls, rearrange_type):
         return rearrange_type in [
-            cls.Skiparse2DSingle,
+            cls.Skiparse2DToken,
             cls.Skiparse2DGroup,
-            cls.Skiparse2DSingle2Group,
-            cls.Skiparse2DGroup2Single,
+            cls.Skiparse2DToken2Group,
+            cls.Skiparse2DGroup2Token,
         ]
 
     @classmethod
-    def is_single2group(cls, rearrange_type):
+    def is_token2group(cls, rearrange_type):
         return rearrange_type in [
-            cls.Skiparse2DSingle2Group,
+            cls.Skiparse2DToken2Group,
         ]
     
     @classmethod
-    def is_group2single(cls, rearrange_type):
+    def is_group2token(cls, rearrange_type):
         return rearrange_type in [
-            cls.Skiparse2DGroup2Single,
+            cls.Skiparse2DGroup2Token,
         ]
 
-# 包装纯函数为 nn.Module，便于torch.compile
+# wrap pure functions to nn.Module, for torch.compile
 class SkiparseRearrange(nn.Module):
 
     _SIMPLE_DISPATCH = {
         RearrangeType.Identity: identity,
-        RearrangeType.Skiparse2DSingle: skiparse_2d_single,
-        RearrangeType.Skiparse2DSingleReverse: skiparse_2d_single_reverse,
+        RearrangeType.Skiparse2DToken: skiparse_2d_token,
+        RearrangeType.Skiparse2DTokenReverse: skiparse_2d_token_reverse,
         RearrangeType.Skiparse2DGroup: skiparse_2d_group,
         RearrangeType.Skiparse2DGroupReverse: skiparse_2d_group_reverse,
-        # 2d_single_to_group 和 2d_group_to_single 有分布式逻辑，单独处理
     }
 
     def __init__(self, sparse_ratio=1, rearrange_type=RearrangeType.Identity):
@@ -166,56 +164,55 @@ class SkiparseRearrange(nn.Module):
         if rearrange_type not in (
             RearrangeType.Identity, RearrangeType.Repeat, RearrangeType.Reduce
         ) and rearrange_type not in self._SIMPLE_DISPATCH and rearrange_type not in (
-            RearrangeType.Skiparse2DSingle2Group, RearrangeType.Skiparse2DGroup2Single
+            RearrangeType.Skiparse2DToken2Group, RearrangeType.Skiparse2DGroup2Token
         ):
             raise ValueError(f"Unsupported rearrange operation: {rearrange_type}")
 
         self.padding_cache = SafeCacheManager(max_cache_size=32)
 
-    # ----------------- skiparse context parallel -----------------
+    # ----------------- skiparse sequence parallel -----------------
     @maybe_compile(disable=True)
-    def _skiparse_cp_scatter(self, x, dim=0):
-        if not use_skiparse_context_parallel():
+    def _skiparse_sp_scatter(self, x, dim=0):
+        if not use_skiparse_sequence_parallel():
             return x
         size = x.shape[dim]
-        cp_size = cp_state.skiparse_cp_size
-        assert size % cp_size == 0
-        chunk_size = size // cp_size
-        return x.narrow(dim, cp_state.skiparse_cp_rank * chunk_size, chunk_size)
+        sp_size = sp_state.skiparse_sp_size
+        assert size % sp_size == 0
+        chunk_size = size // sp_size
+        return x.narrow(dim, sp_state.skiparse_sp_rank * chunk_size, chunk_size)
 
     @maybe_compile(disable=True)
-    def _skiparse_cp_gather(self, x, dim=0):
-        if not use_skiparse_context_parallel():
+    def _skiparse_sp_gather(self, x, dim=0):
+        if not use_skiparse_sequence_parallel():
             return x
-        x = all_gather(x, dim=dim, group=cp_state.skiparse_cp_group)
+        x = all_gather(x, dim=dim, group=sp_state.skiparse_sp_group)
         return x
 
     @maybe_compile(disable=True)
-    def _parallel_skiparse_2d_single_to_group(self, x, grid_sizes, sparse_ratio):
-        return parallel_skiparse_2d_single_to_group(x, grid_sizes, sparse_ratio, cp_state.skiparse_cp_group)
+    def _parallel_skiparse_2d_token_to_group(self, x, grid_sizes, sparse_ratio):
+        return parallel_skiparse_2d_token_to_group(x, grid_sizes, sparse_ratio, sp_state.skiparse_sp_group)
 
     @maybe_compile(disable=True)
-    def _parallel_skiparse_2d_group_to_single(self, x, grid_sizes, sparse_ratio):
-        return parallel_skiparse_2d_group_to_single(x, grid_sizes, sparse_ratio, cp_state.skiparse_cp_group)
+    def _parallel_skiparse_2d_group_to_token(self, x, grid_sizes, sparse_ratio):
+        return parallel_skiparse_2d_group_to_token(x, grid_sizes, sparse_ratio, sp_state.skiparse_sp_group)
 
     def _dispatch_rearrange(self, x, grid_sizes):
         rt = self.rearrange_type
         sr = self.sparse_ratio
 
-        # Repeat / Reduce：带分布式 scatter/gather
         if rt == RearrangeType.Repeat:
-            return self._skiparse_cp_scatter(repeat(x, grid_sizes, sr))
+            return self._skiparse_sp_scatter(repeat(x, grid_sizes, sr))
 
         if rt == RearrangeType.Reduce:
-            return reduce(self._skiparse_cp_gather(x), grid_sizes, sr)
+            return reduce(self._skiparse_sp_gather(x), grid_sizes, sr)
 
-        # 2d single⇄group：有 parallel 快路径
-        if rt in (RearrangeType.Skiparse2DSingle2Group, RearrangeType.Skiparse2DGroup2Single):
+        # 2d token⇄group: parallel fast path
+        if rt in (RearrangeType.Skiparse2DToken2Group, RearrangeType.Skiparse2DGroup2Token):
             plain_fn, parallel_fn = {
-                RearrangeType.Skiparse2DSingle2Group: (skiparse_2d_single_to_group, self._parallel_skiparse_2d_single_to_group),
-                RearrangeType.Skiparse2DGroup2Single: (skiparse_2d_group_to_single, self._parallel_skiparse_2d_group_to_single),
+                RearrangeType.Skiparse2DToken2Group: (skiparse_2d_token_to_group, self._parallel_skiparse_2d_token_to_group),
+                RearrangeType.Skiparse2DGroup2Token: (skiparse_2d_group_to_token, self._parallel_skiparse_2d_group_to_token),
             }[rt]
-            if use_skiparse_context_parallel():
+            if use_skiparse_sequence_parallel():
                 return parallel_fn(x, grid_sizes, sr)
             return plain_fn(x, grid_sizes, sr)
         
@@ -241,7 +238,7 @@ class SkiparseRearrange(nn.Module):
 
     def forward(self, x, grid_sizes=None):
         """
-        带padding的skiparse rearrange。
+        skiparse rearrange with padding.
         """
 
         if x is None:
@@ -262,9 +259,9 @@ class SkiparseRearrange(nn.Module):
                 x = F.pad(x, padding, mode="constant", value=0).view(B, -1, C)
                 grid_sizes = (T, H + num_padding_tokens_h, W + num_padding_tokens_w)
             x = self._dispatch_rearrange(x, grid_sizes)
-            x = self._skiparse_cp_scatter(x)
+            x = self._skiparse_sp_scatter(x)
         elif RearrangeType.input_is_skiparse_2d(self.rearrange_type) and RearrangeType.output_is_full(self.rearrange_type):
-            x = self._skiparse_cp_gather(x)
+            x = self._skiparse_sp_gather(x)
             T, H, W = grid_sizes
             num_padding_tokens_h, num_padding_tokens_w = self.get_num_padding_tokens(grid_sizes)
             if num_padding_tokens_h > 0 or num_padding_tokens_w > 0:
@@ -277,7 +274,7 @@ class SkiparseRearrange(nn.Module):
                 H_orig = H - num_padding_tokens_h
                 W_orig = W - num_padding_tokens_w
                 x = contiguous(x.view(B, T, H, W, C)[:, :, :H_orig, :W_orig]).view(B, -1, C)
-        elif RearrangeType.is_single2group(self.rearrange_type) or RearrangeType.is_group2single(self.rearrange_type):
+        elif RearrangeType.is_token2group(self.rearrange_type) or RearrangeType.is_group2token(self.rearrange_type):
             if self.skiparse_2d:
                 T, H, W = grid_sizes
                 num_padding_tokens_h, num_padding_tokens_w = self.get_num_padding_tokens(grid_sizes)
@@ -302,10 +299,10 @@ class MetaPreprocessor(ABC):
     def preprocess(self, x, grid_sizes, **kwargs):
         pass
             
-class ContextParallelPreprocessor(MetaPreprocessor):
+class SequenceParallelPreprocessor(MetaPreprocessor):
     """
-    在开启context parallel时，正常的skiparse会失效，因为skiparse需要获取全序列信息。
-    一个合理的思路是，按照某种既定规则划分sequence，使得在序列内做skiparse等价于在全序列上做skiparse
+    When sequence parallel is enabled, normal skiparse will fail because skiparse needs to access all sequence information.
+    A reasonable approach is to divide the sequence into sub-sequences according to a certain rule, so that skiparse in the sequence is equivalent to skiparse on the full sequence.
     """
 
     def __init__(
@@ -316,50 +313,49 @@ class ContextParallelPreprocessor(MetaPreprocessor):
         super().__init__(is_skiparse_2d_model, sparse_ratio)
         self.shard_seq_lens_cache = SafeCacheManager(max_cache_size=2)
 
-    def check_short_sequence(self, num_tokens_or_sub_sequences: int, cp_size: int):
-        if (num_tokens_or_sub_sequences % cp_size != 0 and
-                num_tokens_or_sub_sequences <= (num_tokens_or_sub_sequences // cp_size + 1) * (cp_size - 1)):
+    def check_short_sequence(self, num_tokens_or_sub_sequences: int, sp_size: int):
+        if (num_tokens_or_sub_sequences % sp_size != 0 and
+                num_tokens_or_sub_sequences <= (num_tokens_or_sub_sequences // sp_size + 1) * (sp_size - 1)):
             raise ValueError(
-                f"Token {num_tokens_or_sub_sequences} is too short to be divided into {cp_size} parts"
+                f"Token {num_tokens_or_sub_sequences} is too short to be divided into {sp_size} parts"
             )
 
-    def _skiparse_1d_params(self, H, W, cp_size):
-        sub_len = self.sparse_ratio ** 2                      # 每个子模式长度
-        num_sub = math.ceil(H * W / sub_len)                  # 子模式个数
-        self.check_short_sequence(num_sub, cp_size)
-        seq_len_per_cp = math.ceil(num_sub / cp_size) * sub_len
-        return sub_len, num_sub, seq_len_per_cp
+    def _skiparse_1d_params(self, H, W, sp_size):
+        sub_len = self.sparse_ratio ** 2                      # each sub-pattern length
+        num_sub = math.ceil(H * W / sub_len)                  # number of sub-patterns
+        self.check_short_sequence(num_sub, sp_size)
+        seq_len_per_sp = math.ceil(num_sub / sp_size) * sub_len
+        return sub_len, num_sub, seq_len_per_sp
 
-    def _skiparse_2d_params(self, H, W, cp_size):
-        cp_size_h = cp_size // math.ceil(cp_size ** 0.5)
-        cp_size_w = cp_size // cp_size_h
-        assert cp_size_h * cp_size_w == cp_size, (
-            f"Unsupported cp_size={cp_size} for skiparse 2d. "
-            f"Expected cp_size_h * cp_size_w == cp_size, got {cp_size_h} * {cp_size_w}."
+    def _skiparse_2d_params(self, H, W, sp_size):
+        sp_size_h = sp_size // math.ceil(sp_size ** 0.5)
+        sp_size_w = sp_size // sp_size_h
+        assert sp_size_h * sp_size_w == sp_size, (
+            f"Unsupported sp_size={sp_size} for skiparse 2d. "
+            f"Expected sp_size_h * sp_size_w == sp_size, got {sp_size_h} * {sp_size_w}."
         )
         sub_h = self.sparse_ratio ** 2
         sub_w = self.sparse_ratio ** 2
         num_sub_h = math.ceil(H / sub_h)
         num_sub_w = math.ceil(W / sub_w)
-        self.check_short_sequence(num_sub_h, cp_size_h)
-        self.check_short_sequence(num_sub_w, cp_size_w)
-        seq_h = math.ceil(num_sub_h / cp_size_h) * sub_h
-        seq_w = math.ceil(num_sub_w / cp_size_w) * sub_w
+        self.check_short_sequence(num_sub_h, sp_size_h)
+        self.check_short_sequence(num_sub_w, sp_size_w)
+        seq_h = math.ceil(num_sub_h / sp_size_h) * sub_h
+        seq_w = math.ceil(num_sub_w / sp_size_w) * sub_w
         return sub_h, sub_w, num_sub_h, num_sub_w, seq_h, seq_w
 
     # ----------------- preprocess -----------------
 
-    def preprocess(self, x, grid_sizes, cp_type=ContextParallelType.CP):
-        cp_group, cp_rank, cp_size = cp_state.get_cp_infos_with_type(cp_type)
+    def preprocess(self, x, grid_sizes, sp_type=SequenceParallelType.SP):
+        sp_group, sp_rank, sp_size = sp_state.get_sp_infos_with_type(sp_type)
         
-        need_process = (use_context_parallel() or use_full_blocks_context_parallel()) and cp_size > 1
+        need_process = (use_sequence_parallel() or use_full_blocks_sequence_parallel()) and sp_size > 1
         if not need_process:
             return x, grid_sizes
 
-        if cp_type is None or cp_type == ContextParallelType.FullBlocksCP:
-            # 按照普通cp的方式直接在seq维度切分
-            self.check_short_sequence(x.shape[1], cp_size)
-            return contiguous(torch.chunk(x, cp_size, dim=1)[cp_rank]), grid_sizes
+        if sp_type is None or sp_type == SequenceParallelType.FullBlocksSP:
+            self.check_short_sequence(x.shape[1], sp_size)
+            return contiguous(torch.chunk(x, sp_size, dim=1)[sp_rank]), grid_sizes
 
         x = contiguous(x)
         B, N, C = x.shape
@@ -369,13 +365,12 @@ class ContextParallelPreprocessor(MetaPreprocessor):
         # skiparse 2d
         if self.is_skiparse_2d_model:
             x = x.view(B, T, H, W, C)
-            _, _, _, _, seq_h, seq_w = self._skiparse_2d_params(H, W, cp_size)
+            _, _, _, _, seq_h, seq_w = self._skiparse_2d_params(H, W, sp_size)
 
-            # 尽可能接近正方形，如果无法达到正方形，则让cp_size_w更大（因为一般用横屏视频）
-            cp_size_h = cp_size // math.ceil(cp_size ** 0.5)
-            cp_size_w = cp_size // cp_size_h
-            index_h = cp_rank // cp_size_w
-            index_w = cp_rank % cp_size_w
+            sp_size_h = sp_size // math.ceil(sp_size ** 0.5)
+            sp_size_w = sp_size // sp_size_h
+            index_h = sp_rank // sp_size_w
+            index_w = sp_rank % sp_size_w
             start_h = index_h * seq_h
             assert start_h < H, "The start index should be less than the height"
             end_h = min(start_h + seq_h, H)
@@ -386,39 +381,38 @@ class ContextParallelPreprocessor(MetaPreprocessor):
             sub_grid_sizes = (T, end_h - start_h, end_w - start_w)
             return contiguous(x).view(B, -1, C), sub_grid_sizes
 
-        # 普通 cp
-        self.check_short_sequence(N, cp_size)
-        return contiguous(torch.chunk(x, cp_size, dim=1)[cp_rank]), sub_grid_sizes
+        self.check_short_sequence(N, sp_size)
+        return contiguous(torch.chunk(x, sp_size, dim=1)[sp_rank]), sub_grid_sizes
 
     # ----------------- postprocess -----------------
 
-    def postprocess(self, x, grid_sizes, shard_seq_lens=None, cp_type=ContextParallelType.CP):
-        cp_group, cp_rank, cp_size = cp_state.get_cp_infos_with_type(cp_type)
+    def postprocess(self, x, grid_sizes, shard_seq_lens=None, sp_type=SequenceParallelType.SP):
+        sp_group, sp_rank, sp_size = sp_state.get_sp_infos_with_type(sp_type)
         
-        need_process = (use_context_parallel() or use_full_blocks_context_parallel()) and cp_size > 1
+        need_process = (use_sequence_parallel() or use_full_blocks_sequence_parallel()) and sp_size > 1
         if not need_process:
             return x
 
-        if cp_type is None or cp_type == ContextParallelType.FullBlocksCP:
-            return all_gather(x, dim=1, group=cp_group)
+        if sp_type is None or sp_type == SequenceParallelType.FullBlocksSP:
+            return all_gather(x, dim=1, group=sp_group)
 
         x = contiguous(x)
         T, H, W = grid_sizes
 
-        # ========== skiparse 2d 逆 ==========
+        # ========== skiparse 2d reverse ==========
         if self.is_skiparse_2d_model:
-            _, _, _, _, seq_h, seq_w = self._skiparse_2d_params(H, W, cp_size)
-            cp_size_h = cp_size // math.ceil(cp_size ** 0.5)
-            cp_size_w = cp_size // cp_size_h
+            _, _, _, _, seq_h, seq_w = self._skiparse_2d_params(H, W, sp_size)
+            sp_size_h = sp_size // math.ceil(sp_size ** 0.5)
+            sp_size_w = sp_size // sp_size_h
 
             B, _, C = x.shape
-            x = all_gather(x, dim=1, group=cp_group)
+            x = all_gather(x, dim=1, group=sp_group)
             x_list = x.split_with_sizes(shard_seq_lens, dim=1)
             x_out_w = []
             x_out = []
-            for r in range(cp_size):
-                index_h = r // cp_size_w
-                index_w = r % cp_size_w
+            for r in range(sp_size):
+                index_h = r // sp_size_w
+                index_w = r % sp_size_w
                 start_h = index_h * seq_h
                 end_h = min(start_h + seq_h, H)
                 start_w = index_w * seq_w
@@ -427,59 +421,59 @@ class ContextParallelPreprocessor(MetaPreprocessor):
                 h_len = end_h - start_h
                 w_len = end_w - start_w
                 x_out_w.append(contiguous(x_list[r]).view(B, T, h_len, w_len, C))
-                if index_w == cp_size_w - 1 and len(x_out_w) == cp_size_w:
+                if index_w == sp_size_w - 1 and len(x_out_w) == sp_size_w:
                     x_out.append(torch.cat(x_out_w, dim=3))
                     x_out_w = []
             x_out = torch.cat(x_out, dim=2)
             return contiguous(x_out).view(B, -1, C)
 
-        # ========== 普通 cp 逆 ==========
-        return all_gather(x, dim=1, group=cp_group)
+        # ========== normal sp reverse ==========
+        return all_gather(x, dim=1, group=sp_group)
 
-    def get_shard_seq_lens(self, shape, grid_sizes, device="cuda", cp_type=ContextParallelType.CP):
-        cp_group, cp_rank, cp_size = cp_state.get_cp_infos_with_type(cp_type)
+    def get_shard_seq_lens(self, shape, grid_sizes, device="cuda", sp_type=SequenceParallelType.SP):
+        sp_group, sp_rank, sp_size = sp_state.get_sp_infos_with_type(sp_type)
         
-        need_shard = (use_context_parallel() or use_full_blocks_context_parallel()) and cp_size > 1
+        need_shard = (use_sequence_parallel() or use_full_blocks_sequence_parallel()) and sp_size > 1
         if not need_shard:
             return [[shape[1]] for _ in range(3)]
 
-        key = (shape, grid_sizes, cp_type)
+        key = (shape, grid_sizes, sp_type)
         if self.shard_seq_lens_cache.is_exist(key):
             return self.shard_seq_lens_cache.get(key)
         
         _, N, _ = shape
         
         dummy = torch.ones((1, N, 1), dtype=torch.bool, device=device)
-        dummy, sub_grid_sizes = self.preprocess(dummy, grid_sizes, cp_type=cp_type)
+        dummy, sub_grid_sizes = self.preprocess(dummy, grid_sizes, sp_type=sp_type)
 
-        if cp_type is None or cp_type == ContextParallelType.FullBlocksCP:
-            full_blocks_shard_seq_lens = get_shard_seq_lens(dummy, cp_state.full_cp_group)
+        if sp_type is None or sp_type == SequenceParallelType.FullBlocksSP:
+            full_blocks_shard_seq_lens = get_shard_seq_lens(dummy, sp_state.full_sp_group)
             self.shard_seq_lens_cache.set(key, (full_blocks_shard_seq_lens, None, None))
             return [full_blocks_shard_seq_lens for _ in range(3)]
 
-        full_shard_seq_lens = get_shard_seq_lens(dummy, cp_state.cp_group)
+        full_shard_seq_lens = get_shard_seq_lens(dummy, sp_state.sp_group)
 
         if self.is_skiparse_2d_model:
-            single_rearrange_type = RearrangeType.Skiparse2DSingle
+            token_rearrange_type = RearrangeType.Skiparse2DToken
             group_rearrange_type = RearrangeType.Skiparse2DGroup
         else:
-            single_rearrange_type = RearrangeType.Identity
+            token_rearrange_type = RearrangeType.Identity
             group_rearrange_type = RearrangeType.Identity
-        single_rearrange = SkiparseRearrange(self.sparse_ratio, single_rearrange_type)
+        token_rearrange = SkiparseRearrange(self.sparse_ratio, token_rearrange_type)
         group_rearrange = SkiparseRearrange(self.sparse_ratio, group_rearrange_type)
-        single_dummy = single_rearrange(dummy, sub_grid_sizes)
+        token_dummy = token_rearrange(dummy, sub_grid_sizes)
         group_dummy = group_rearrange(dummy, sub_grid_sizes)
-        single_shard_seq_lens = get_shard_seq_lens(single_dummy, cp_state.cp_group)
-        group_shard_seq_lens = get_shard_seq_lens(group_dummy, cp_state.cp_group)
+        token_shard_seq_lens = get_shard_seq_lens(token_dummy, sp_state.sp_group)
+        group_shard_seq_lens = get_shard_seq_lens(group_dummy, sp_state.sp_group)
 
-        self.shard_seq_lens_cache.set(key, (full_shard_seq_lens, single_shard_seq_lens, group_shard_seq_lens))
+        self.shard_seq_lens_cache.set(key, (full_shard_seq_lens, token_shard_seq_lens, group_shard_seq_lens))
 
-        return full_shard_seq_lens, single_shard_seq_lens, group_shard_seq_lens
+        return full_shard_seq_lens, token_shard_seq_lens, group_shard_seq_lens
 
 
 class SkiparseMaskPreprocessor(MetaPreprocessor):
     """
-    生成skiparse attention下的attention mask。
+    Generate attention mask for skiparse attention.
     """
 
     def __init__(
@@ -491,16 +485,16 @@ class SkiparseMaskPreprocessor(MetaPreprocessor):
         self.cache = SafeCacheManager()
 
         if self.is_skiparse_2d_model:
-            self.single_rearrange_type = RearrangeType.Skiparse2DSingle
+            self.token_rearrange_type = RearrangeType.Skiparse2DToken
             self.group_rearrange_type = RearrangeType.Skiparse2DGroup
         else:
-            self.single_rearrange_type = RearrangeType.Identity
+            self.token_rearrange_type = RearrangeType.Identity
             self.group_rearrange_type = RearrangeType.Identity
-        self.single_rearrange = SkiparseRearrange(self.sparse_ratio, self.single_rearrange_type)
+        self.token_rearrange = SkiparseRearrange(self.sparse_ratio, self.token_rearrange_type)
         self.group_rearrange = SkiparseRearrange(self.sparse_ratio, self.group_rearrange_type)
 
     def _normalize_mask(self, mask):
-        """将全 True 的 mask 归一化为 None"""
+        """Normalize mask to None if all True"""
         if mask is None:
             return None
         # mask: (batch_size, seq_len), dtype=bool
@@ -508,7 +502,7 @@ class SkiparseMaskPreprocessor(MetaPreprocessor):
             return None
         return mask
 
-    def preprocess(self, shape, grid_sizes, context_preprocessor=None, dtype=torch.bool, device="cuda"):
+    def preprocess(self, shape, grid_sizes, sequence_preprocessor=None, dtype=torch.bool, device="cuda"):
         if not self.is_skiparse_2d_model or self.sparse_ratio == 1:
             return (None, None, None, None)
 
@@ -520,63 +514,57 @@ class SkiparseMaskPreprocessor(MetaPreprocessor):
         mask = torch.ones((B, N, 1), dtype=dtype, device=device)
         sub_grid_sizes = grid_sizes
 
-        # 不用考虑full_blocks_cp，因为full block固定用None mask
-        if use_context_parallel() and context_preprocessor is not None:
-            mask, sub_grid_sizes = context_preprocessor.preprocess(mask, grid_sizes, cp_type=ContextParallelType.CP)
+        if use_sequence_parallel() and sequence_preprocessor is not None:
+            mask, sub_grid_sizes = sequence_preprocessor.preprocess(mask, grid_sizes, sp_type=SequenceParallelType.SP)
 
-        local_single_mask = self.single_rearrange(mask, sub_grid_sizes)
+        local_token_mask = self.token_rearrange(mask, sub_grid_sizes)
         local_group_mask = self.group_rearrange(mask, sub_grid_sizes)
 
-        global_single_mask = local_single_mask
+        global_token_mask = local_token_mask
         global_group_mask = local_group_mask
-        if use_context_parallel() and context_preprocessor is not None:
-            stacked = torch.cat([local_single_mask, local_group_mask], dim=-1)  # [B, N, 2]
-            stacked = all_gather(stacked, dim=1, group=cp_state.cp_group)
-            global_single_mask, global_group_mask = stacked.split(1, dim=-1)
+        if use_sequence_parallel() and sequence_preprocessor is not None:
+            stacked = torch.cat([local_token_mask, local_group_mask], dim=-1)  # [B, N, 2]
+            stacked = all_gather(stacked, dim=1, group=sp_state.sp_group)
+            global_token_mask, global_group_mask = stacked.split(1, dim=-1)
 
-        local_single_mask = local_single_mask.squeeze(-1).bool()
-        local_group_mask = local_group_mask.squeeze(-1).bool()
-        global_single_mask = global_single_mask.squeeze(-1).bool()
-        global_group_mask = global_group_mask.squeeze(-1).bool()
-
-        local_single_mask = self._normalize_mask(local_single_mask)
+        local_token_mask = self._normalize_mask(local_token_mask)
         local_group_mask = self._normalize_mask(local_group_mask)
-        global_single_mask = self._normalize_mask(global_single_mask)
+        global_token_mask = self._normalize_mask(global_token_mask)
         global_group_mask = self._normalize_mask(global_group_mask)
 
-        local_single_mask = contiguous(local_single_mask)
+        local_token_mask = contiguous(local_token_mask)
         local_group_mask = contiguous(local_group_mask)
-        global_single_mask = contiguous(global_single_mask)
+        global_token_mask = contiguous(global_token_mask)
         global_group_mask = contiguous(global_group_mask)
 
         rank = safe_get_rank()
-        if rank < cp_state.global_cp_size:
+        if rank < sp_state.global_sp_size:
             print(f"=" * 20 + f" SkiparseMaskPreprocessor Cache Miss Rank #{rank}" + "=" * 20)
-            print(f"local_single_mask is None: {local_single_mask is None}")
+            print(f"local_token_mask is None: {local_token_mask is None}")
             print(f"local_group_mask is None: {local_group_mask is None}")
-            print(f"global_single_mask is None: {global_single_mask is None}")
+            print(f"global_token_mask is None: {global_token_mask is None}")
             print(f"global_group_mask is None: {global_group_mask is None}")
             print(f"=" * 20 + f" SkiparseMaskPreprocessor Cache Miss Rank #{rank}" + "=" * 20)
 
-        self.cache.set(key, (local_single_mask, local_group_mask, global_single_mask, global_group_mask))
-        return local_single_mask, local_group_mask, global_single_mask, global_group_mask
+        self.cache.set(key, (local_token_mask, local_group_mask, global_token_mask, global_group_mask))
+        return local_token_mask, local_group_mask, global_token_mask, global_group_mask
 
 class SkiparseRopeWrapper:
-    def __init__(self, freqs, context_preprocessor=None):
+    def __init__(self, freqs, sequence_preprocessor=None):
         self.freqs = freqs                                  # (max_len, head_dim), real float32
-        self.context_preprocessor = context_preprocessor
+        self.sequence_preprocessor = sequence_preprocessor
         self.cache = SafeCacheManager(max_cache_size=4)
         self.real_dtype = torch.float32
 
     @maybe_compile(disable=True)
-    def prepare_freqs(self, x, grid_sizes, head_dim, skiparse_rerrange=None, cp_type=ContextParallelType.CP):
+    def prepare_freqs(self, x, grid_sizes, head_dim, skiparse_rerrange=None, sp_type=SequenceParallelType.SP):
         T, H, W = grid_sizes
         rearrange_type = (
             skiparse_rerrange.rearrange_type
             if skiparse_rerrange is not None
             else RearrangeType.Identity
         )
-        key = (T, H, W, rearrange_type, cp_type, x.device)
+        key = (T, H, W, rearrange_type, sp_type, x.device)
 
         if self.cache.is_exist(key):
             return self.cache.get(key)
@@ -593,23 +581,23 @@ class SkiparseRopeWrapper:
                 freqs[2][:W].view(1, 1, W, -1).expand(T, H, W, -1),
             ],
             dim=-1,
-        ).reshape(1, T * H * W, -1)   # (1, T*H*W, head_dim)，注意存的是角度 θ
+        ).reshape(1, T * H * W, -1)   # (1, T*H*W, head_dim); note this stores the angle theta
 
-        # ----- Context Parallel 预处理 -----
+        # ----- Sequence Parallel preprocessing -----
         sub_grid_sizes = grid_sizes
-        if use_context_parallel() and self.context_preprocessor is not None:
-            freqs_i, sub_grid_sizes = self.context_preprocessor.preprocess(
-                freqs_i, grid_sizes, cp_type=cp_type
+        if use_sequence_parallel() and self.sequence_preprocessor is not None:
+            freqs_i, sub_grid_sizes = self.sequence_preprocessor.preprocess(
+                freqs_i, grid_sizes, sp_type=sp_type
             )
 
         # ----- Skiparse rearrange -----
         if skiparse_rerrange is not None:
             freqs_i = skiparse_rerrange(freqs_i, sub_grid_sizes)
 
-        # ----- Context Parallel all-gather -----
-        if use_context_parallel() and self.context_preprocessor is not None:
-            cp_group, _, _ = cp_state.get_cp_infos_with_type(cp_type)
-            freqs_i = all_gather(freqs_i, dim=1, group=cp_group)
+        # ----- Sequence Parallel all-gather -----
+        if use_sequence_parallel() and self.sequence_preprocessor is not None:
+            sp_group, _, _ = sp_state.get_sp_infos_with_type(sp_type)
+            freqs_i = all_gather(freqs_i, dim=1, group=sp_group)
 
         freqs_i = freqs_i.to(self.real_dtype)
         cos_f = freqs_i.cos().unsqueeze(2)   # (1, seq, 1, head_dim)
@@ -619,9 +607,8 @@ class SkiparseRopeWrapper:
         self.cache.set(key, result)
         return result
 
-    # ----- 实数 RoPE -----
     @torch.autocast("cuda", enabled=False)
-    def apply_rope(self, x, grid_sizes, skiparse_rerrange=None, cp_type=ContextParallelType.CP):
+    def apply_rope(self, x, grid_sizes, skiparse_rerrange=None, sp_type=SequenceParallelType.SP):
         """
         x: (B, seq_len, num_heads, head_dim * 2)
         """
@@ -629,18 +616,18 @@ class SkiparseRopeWrapper:
         head_dim = head_dim // 2
 
         x = x.to(self.real_dtype).reshape(-1, seq_len, num_heads, head_dim, 2)
-        x1 = x[..., 0]   # (B, seq, heads, head_dim) # 实部
-        x2 = x[..., 1]   # (B, seq, heads, head_dim) # 虚部
+        x1 = x[..., 0]   # (B, seq, heads, head_dim) # real part
+        x2 = x[..., 1]   # (B, seq, heads, head_dim) # imaginary part
 
-        # 获取 cos/sin
+        # get cos/sin
         cos_f, sin_f = self.prepare_freqs(
-            x, grid_sizes, head_dim, skiparse_rerrange, cp_type
+            x, grid_sizes, head_dim, skiparse_rerrange, sp_type
         )
 
         # cos_f/sin_f shape: (freqs_B, seq, 1, head_dim)
         # x1/x2 shape:       (B,       seq, heads, head_dim)
-        # 当 skiparse rearrange 后 freqs_B = P²，x 的 B = P²*b
-        # 需要把 freqs repeat b 次对齐
+        # When skiparse rearrange, freqs_B = P², x's B = P²*b
+        # We need to repeat freqs b times to align
         freqs_B = cos_f.shape[0]
         if freqs_B > 1 and B != freqs_B:
             # B = P² * b, freqs_B = P²
@@ -650,12 +637,11 @@ class SkiparseRopeWrapper:
             cos_f = cos_f.repeat_interleave(b, dim=0)
             sin_f = sin_f.repeat_interleave(b, dim=0)
 
-        # 复数乘法的实数等价：
         # (x1 + x2·i)(cosθ + sinθ·i) = (x1·cos - x2·sin) + (x1·sin + x2·cos)·i
         o1 = x1 * cos_f - x2 * sin_f
         o2 = x1 * sin_f + x2 * cos_f
 
-        # 交织回原始 layout
+        # to original layout
         out = torch.stack([o1, o2], dim=-1).flatten(3)  # (B, seq, heads, head_dim*2)
         return out.float()
 
@@ -668,7 +654,7 @@ class OSPNextSelfAttention(nn.Module):
         window_size=(-1, -1), 
         qk_norm=True, 
         eps=1e-6, 
-        # skiparse相关
+        # skiparse related
         sparse_ratio=2,
         skiparse_block_type=SkiparseBlockType.Full,
         # hif8 quantization
@@ -700,10 +686,10 @@ class OSPNextSelfAttention(nn.Module):
         self.skiparse_block_type = skiparse_block_type
         if self.skiparse_block_type == SkiparseBlockType.Full:
             self.rearrange_rope = SkiparseRearrange(rearrange_type=RearrangeType.Identity)
-        elif self.skiparse_block_type == SkiparseBlockType.Single:
+        elif self.skiparse_block_type == SkiparseBlockType.Token:
             self.rearrange_rope = SkiparseRearrange(
                 sparse_ratio=sparse_ratio,
-                rearrange_type=RearrangeType.Skiparse2DSingle,
+                rearrange_type=RearrangeType.Skiparse2DToken,
             )
         elif self.skiparse_block_type == SkiparseBlockType.Group:
             self.rearrange_rope = SkiparseRearrange(
@@ -712,9 +698,9 @@ class OSPNextSelfAttention(nn.Module):
             )
 
         if self.skiparse_block_type == SkiparseBlockType.Full:
-            self.cp_type = ContextParallelType.FullBlocksCP
+            self.sp_type = SequenceParallelType.FullBlocksSP
         else:
-            self.cp_type = ContextParallelType.CP
+            self.sp_type = SequenceParallelType.SP
             
 
     @maybe_compile(disable=True)
@@ -724,12 +710,12 @@ class OSPNextSelfAttention(nn.Module):
         shard_seq_lens=None,
     ):
 
-        if use_context_parallel() or use_full_blocks_context_parallel():
-            cp_group, cp_rank, cp_size = cp_state.get_cp_infos_with_type(self.cp_type)
-            if cp_size > 1:
-                q = all_to_all_4D(q, group=cp_group, scatter_dim=2, gather_dim=1, shard_seq_lens=shard_seq_lens)
-                k = all_to_all_4D(k, group=cp_group, scatter_dim=2, gather_dim=1, shard_seq_lens=shard_seq_lens)
-                v = all_to_all_4D(v, group=cp_group, scatter_dim=2, gather_dim=1, shard_seq_lens=shard_seq_lens)
+        if use_sequence_parallel() or use_full_blocks_sequence_parallel():
+            sp_group, sp_rank, sp_size = sp_state.get_sp_infos_with_type(self.sp_type)
+            if sp_size > 1:
+                q = all_to_all_4D(q, group=sp_group, scatter_dim=2, gather_dim=1, shard_seq_lens=shard_seq_lens)
+                k = all_to_all_4D(k, group=sp_group, scatter_dim=2, gather_dim=1, shard_seq_lens=shard_seq_lens)
+                v = all_to_all_4D(v, group=sp_group, scatter_dim=2, gather_dim=1, shard_seq_lens=shard_seq_lens)
         return q, k, v
 
 
@@ -739,10 +725,10 @@ class OSPNextSelfAttention(nn.Module):
         x,
         shard_seq_lens=None,
     ):
-        if use_context_parallel() or use_full_blocks_context_parallel():
-            cp_group, cp_rank, cp_size = cp_state.get_cp_infos_with_type(self.cp_type)
-            if cp_size > 1:
-                x = all_to_all_4D(x, group=cp_group, scatter_dim=1, gather_dim=2, shard_seq_lens=shard_seq_lens)
+        if use_sequence_parallel() or use_full_blocks_sequence_parallel():
+            sp_group, sp_rank, sp_size = sp_state.get_sp_infos_with_type(self.sp_type)
+            if sp_size > 1:
+                x = all_to_all_4D(x, group=sp_group, scatter_dim=1, gather_dim=2, shard_seq_lens=shard_seq_lens)
         return x
 
     def forward(
@@ -764,8 +750,8 @@ class OSPNextSelfAttention(nn.Module):
             q, k, v, shard_seq_lens
         )
 
-        q = rope_wrapper.apply_rope(q, grid_sizes_for_rope, self.rearrange_rope, cp_type=self.cp_type)
-        k = rope_wrapper.apply_rope(k, grid_sizes_for_rope, self.rearrange_rope, cp_type=self.cp_type)
+        q = rope_wrapper.apply_rope(q, grid_sizes_for_rope, self.rearrange_rope, sp_type=self.sp_type)
+        k = rope_wrapper.apply_rope(k, grid_sizes_for_rope, self.rearrange_rope, sp_type=self.sp_type)
 
         if self.quant_attn == "hif8":
             x = hif8_attention_with_mask(
@@ -781,8 +767,7 @@ class OSPNextSelfAttention(nn.Module):
             x = attention_with_mask(
                 q,
                 k, 
-                v, 
-                # self attn，q/k/v共享mask
+                v,
                 attn_mask=attn_mask,
                 attn_mask_kv=attn_mask,
             )
@@ -812,9 +797,6 @@ class OSPNextCrossAttention(OSPNextSelfAttention):
         k = self.norm_k(self.k(text)).view(B, -1, H, D)
         v = self.v(text).view(B, -1, H, D)
 
-        # NOTE cross attn不需要all2all，因为img只作为q，天然支持按序列切分计算
-
-        # cross attn，q作为query，k/v作为key/value，k/v没有mask
         if self.quant_attn == "hif8":
             x = hif8_attention_with_mask(
                 q,
@@ -829,8 +811,6 @@ class OSPNextCrossAttention(OSPNextSelfAttention):
         else:
             x = attention_with_mask(q, k, v, attn_mask=attn_mask, attn_mask_kv=None, is_cross_attn=True)
 
-        # NOTE cross attn不需要all2all，因为img只作为q，天然支持按序列切分计算
-        
         # output
         x = x.flatten(2)
         x = self.o(x)
@@ -848,7 +828,7 @@ class OSPNextAttentionBlock(nn.Module):
         qk_norm=True,
         cross_attn_norm=False,
         eps=1e-6,
-        # skiparse相关
+        # skiparse related
         sparse_ratio=2,
         skiparse_block_type=SkiparseBlockType.Full,
         is_full2skiparse_block=False,
@@ -885,7 +865,7 @@ class OSPNextAttentionBlock(nn.Module):
             else nn.Identity()
         )
         self.cross_attn = OSPNextCrossAttention(
-            dim, num_heads, (-1, -1), qk_norm, eps,
+            dim, num_heads, window_size, qk_norm, eps,
             quant=quant,
             quant_attn=quant_attn,
             scale_max_forward=scale_max_forward,
@@ -915,24 +895,24 @@ class OSPNextAttentionBlock(nn.Module):
                 sparse_ratio=self.sparse_ratio ** 2, 
                 rearrange_type=RearrangeType.Repeat
             )
-            if self.skiparse_block_type == SkiparseBlockType.Single:
+            if self.skiparse_block_type == SkiparseBlockType.Token:
                 if self.is_full2skiparse_block:
                     self.rearrange_input = SkiparseRearrange(
                         sparse_ratio=self.sparse_ratio,
-                        rearrange_type=RearrangeType.Skiparse2DSingle,
+                        rearrange_type=RearrangeType.Skiparse2DToken,
                     )
                     self.rearrange_output = SkiparseRearrange(rearrange_type=RearrangeType.Identity)
                 else:
                     self.rearrange_input = SkiparseRearrange(
                         sparse_ratio=self.sparse_ratio,
-                        rearrange_type=RearrangeType.Skiparse2DGroup2Single,
+                        rearrange_type=RearrangeType.Skiparse2DGroup2Token,
                     )
                     self.rearrange_output = SkiparseRearrange(rearrange_type=RearrangeType.Identity)
             elif self.skiparse_block_type == SkiparseBlockType.Group:
                 if self.is_skiparse2full_block:
                     self.rearrange_input = SkiparseRearrange(
                         sparse_ratio=self.sparse_ratio,
-                        rearrange_type=RearrangeType.Skiparse2DSingle2Group,
+                        rearrange_type=RearrangeType.Skiparse2DToken2Group,
                     )
                     self.rearrange_output = SkiparseRearrange(
                         sparse_ratio=self.sparse_ratio,
@@ -941,7 +921,7 @@ class OSPNextAttentionBlock(nn.Module):
                 else:
                     self.rearrange_input = SkiparseRearrange(
                         sparse_ratio=self.sparse_ratio,
-                        rearrange_type=RearrangeType.Skiparse2DSingle2Group,
+                        rearrange_type=RearrangeType.Skiparse2DToken2Group,
                     )
                     self.rearrange_output = SkiparseRearrange(rearrange_type=RearrangeType.Identity)
 
@@ -992,16 +972,15 @@ class OSPNextAttentionBlock(nn.Module):
         shard_seq_lens=None,
         gradient_checkpointing=False,
     ):
-        # 对输入做rerrange
+        # rearrange input
         x = self.rearrange_input(x, grid_sizes=sub_grid_sizes)
         text = self.context_rearrange_input(text)
         e = self.context_rearrange_input(e)
 
         if gradient_checkpointing and torch.is_grad_enabled():
-            # 收集本 block 内所有 LoRA 参数，显式传入 checkpoint，
-            # 确保 checkpoint 的 autograd 能正确追踪 LoRA 参数的梯度。
-            # 不这样做的话，use_reentrant=False 的 checkpoint 在 FSDP2 环境下
-            # 无法感知 LoRA 参数参与了计算，导致 LoRA 梯度为零。
+            # collect all LoRA parameters in this block, explicitly pass them to checkpoint
+            # to ensure that the autograd of the checkpoint can correctly track the gradient of LoRA parameters.
+            # Otherwise, the checkpoint in FSDP2 environment cannot track the gradient of LoRA parameters, causing the LoRA gradient to be zero.
             _lora_params = [p for n, p in self.named_parameters() if 'lora_' in n]
 
             def _checkpointed_block_forward(x, attn_mask, cross_attn_mask, e,
@@ -1039,7 +1018,7 @@ class OSPNextAttentionBlock(nn.Module):
                 shard_seq_lens=shard_seq_lens,
             )
 
-        # 对输出做rerrange
+        # rearrange output
         x = self.rearrange_output(x, grid_sizes=sub_grid_sizes)
 
         return x
@@ -1048,7 +1027,7 @@ class OSPNextAttentionBlock(nn.Module):
 class OSPNextModel(ModelMixin, ConfigMixin):
 
     r"""
-    OSPNext model. 基于WanT2V，添加了skiparse机制。
+    OSPNext model. Based on WanT2V, added skiparse mechanism.
     """
 
     ignore_for_config = [
@@ -1077,7 +1056,7 @@ class OSPNextModel(ModelMixin, ConfigMixin):
         qk_norm=True,
         cross_attn_norm=True,
         eps=1e-6,
-        # skiparse相关参数
+        # skiparse related parameters
         skiparse_model_type=SkiparseModelType.Full,
         sparse_ratio=1,
         num_full_blocks=0,
@@ -1145,7 +1124,7 @@ class OSPNextModel(ModelMixin, ConfigMixin):
             else:
                 raise ValueError(f"Unsupported skiparse model type: {self.skiparse_model_type}")
 
-        # 添加虚拟的两端full block，方便处理边界情况
+        # add virtual full blocks at both ends to handle boundary cases
         full_block_indices = [-1] + full_block_indices + [self.num_layers]
 
         self.blocks = nn.ModuleList()
@@ -1153,12 +1132,12 @@ class OSPNextModel(ModelMixin, ConfigMixin):
             if i in full_block_indices:
                 skiparse_block_type = SkiparseBlockType.Full
             elif i % 2 == 0:
-                skiparse_block_type = SkiparseBlockType.Single
+                skiparse_block_type = SkiparseBlockType.Token
             else:
                 skiparse_block_type = SkiparseBlockType.Group
-            # 当前block是sparse，上一个block是full
+            # current block is sparse, previous block is full
             is_full2skiparse_block = (i - 1) in full_block_indices and i not in full_block_indices
-            # 当前block是sparse，下一个block是full
+            # current block is sparse, next block is full
             is_skiparse2full_block = (i + 1) in full_block_indices and i not in full_block_indices
             self.blocks.append(
                 OSPNextAttentionBlock(
@@ -1180,7 +1159,7 @@ class OSPNextModel(ModelMixin, ConfigMixin):
                 )
             )
 
-        # 初始化block结束后删除两个dummy full block
+        # delete two dummy full blocks after initializing blocks
         self.full_block_indices = full_block_indices[1:-1]
 
         # head
@@ -1198,38 +1177,38 @@ class OSPNextModel(ModelMixin, ConfigMixin):
             sparse_ratio=self.sparse_ratio,
         )
 
-        # cp管理器。要兼容skiparse attn的情况下，Ulysses cp需要按照特定规则切分序列
-        self.context_preprocessor = ContextParallelPreprocessor(
+        # sequence parallel preprocessor. To handle skiparse attention, Ulysses sequence parallel needs to split sequences according to specific rules.
+        self.sequence_preprocessor = SequenceParallelPreprocessor(
             is_skiparse_2d_model=self.skiparse_model_type != SkiparseModelType.Full,
             sparse_ratio=self.sparse_ratio,
         )
 
-        # full block部分无法采用SSP，所以采用Ulysses SP
-        self.need_full_blocks_context_parallel = self.skiparse_model_type != SkiparseModelType.Full and self.num_full_blocks > 0
+        # full blocks cannot use SSP, so use Ulysses SP
+        self.need_full_blocks_sequence_parallel = self.skiparse_model_type != SkiparseModelType.Full and self.num_full_blocks > 0
 
         """
-        skiparse cp 的逻辑完全写在了skiparse rearrange中，会根据当前block type自动触发
+        skiparse sequence parallel logic is completely written in skiparse rearrange, which will automatically trigger all_to_all, gather, scatter according to the current block type.
         all_to_all, gather, scatter。
-        因此我们只需要关注ulysses cp下该怎么操作序列
+        Therefore, we only need to focus on how to operate sequences under Ulysses sequence parallel.
         """
-        # main_cp_type指大部分sparse block采用的self attn处的cp
+        # main_sp_type refers to the sp of self attention for most sparse blocks
         if self.skiparse_model_type == SkiparseModelType.Full:
-            self.main_cp_type = ContextParallelType.FullBlocksCP
+            self.main_sp_type = SequenceParallelType.FullBlocksSP
         else:
-            self.main_cp_type = ContextParallelType.CP
+            self.main_sp_type = SequenceParallelType.SP
 
-        # final_cp_type指最后一个block采用的self attn处的cp，用于还原序列
+        # final_sp_type refers to the sp of self attention for the last block, used to restore sequences
         if self.blocks[-1].skiparse_block_type == SkiparseBlockType.Full:
-            self.final_cp_type = ContextParallelType.FullBlocksCP
+            self.final_sp_type = SequenceParallelType.FullBlocksSP
         else:
-            self.final_cp_type = ContextParallelType.CP
+            self.final_sp_type = SequenceParallelType.SP
 
         if safe_get_rank() == 0:
             print(f"=" * 20 + f"OSPNextModel init" + "=" * 20)
             print(f"skiparse_model_type: {self.skiparse_model_type}")
             print(f"sparse_ratio: {self.sparse_ratio}")
             print(f"num_full_blocks: {self.num_full_blocks}")
-            print(f"need_full_blocks_context_parallel: {self.need_full_blocks_context_parallel}")
+            print(f"need_full_blocks_sequence_parallel: {self.need_full_blocks_sequence_parallel}")
             print(f"full_block_indices: {self.full_block_indices}")
             print(f"=" * 20 + f"OSPNextModel init" + "=" * 20)
 
@@ -1253,7 +1232,7 @@ class OSPNextModel(ModelMixin, ConfigMixin):
 
         # params
         device = self.patch_embedding.weight.device
-        use_full_blocks_cp = use_full_blocks_context_parallel() and self.need_full_blocks_context_parallel
+        use_full_blocks_sp = use_full_blocks_sequence_parallel() and self.need_full_blocks_sequence_parallel
 
         # maybe we use meta device for init, so rope freqs should init before forward
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
@@ -1266,7 +1245,7 @@ class OSPNextModel(ModelMixin, ConfigMixin):
                 ],
                 dim=1,
             ).to(device)
-            self.rope_wrapper = SkiparseRopeWrapper(self.freqs, self.context_preprocessor)
+            self.rope_wrapper = SkiparseRopeWrapper(self.freqs, self.sequence_preprocessor)
 
         # embeddings
         x = self.patch_embedding(x)
@@ -1278,53 +1257,52 @@ class OSPNextModel(ModelMixin, ConfigMixin):
         grid_sizes_for_rope = grid_sizes
         patchify_x_shape = x.shape
 
-        # 计算shard_seq_lens，在all2all中用于恢复原序列长度
-        full_shard_seq_lens, single_shard_seq_lens, group_shard_seq_lens = self.context_preprocessor.get_shard_seq_lens(
-            patchify_x_shape, grid_sizes, device=device, cp_type=self.main_cp_type
+        # calculate shard_seq_lens, used to restore original sequence length in all_to_all
+        full_shard_seq_lens, single_shard_seq_lens, group_shard_seq_lens = self.sequence_preprocessor.get_shard_seq_lens(
+            patchify_x_shape, grid_sizes, device=device, sp_type=self.main_sp_type
         )
         full_block_full_shard_seq_lens = full_shard_seq_lens
-        if use_full_blocks_cp:
-            full_block_full_shard_seq_lens, _, _ = self.context_preprocessor.get_shard_seq_lens(
-                patchify_x_shape, grid_sizes, device=device, cp_type=ContextParallelType.FullBlocksCP
+        if use_full_blocks_sp:
+            full_block_full_shard_seq_lens, _, _ = self.sequence_preprocessor.get_shard_seq_lens(
+                patchify_x_shape, grid_sizes, device=device, sp_type=SequenceParallelType.FullBlocksSP
             )
 
-        # skiparse过程中可能有padding，所以需要生成mask
-        # mask需要传入context preprocessor，以对齐cp切分后的seq
+        # mask needs to be passed to sequence preprocessor, to align with the sequence split by sequence parallel
         local_single_mask, local_group_mask, global_single_mask, global_group_mask = self.mask_preprocessor.preprocess(
-            patchify_x_shape, grid_sizes, context_preprocessor=self.context_preprocessor,
+            patchify_x_shape, grid_sizes, sequence_preprocessor=self.sequence_preprocessor,
             dtype=torch.bool, device=device
         )
         
-        x, sub_grid_sizes = self.context_preprocessor.preprocess(
+        x, sub_grid_sizes = self.sequence_preprocessor.preprocess(
             x, grid_sizes,
-            cp_type=self.main_cp_type if not use_full_blocks_cp else ContextParallelType.FullBlocksCP
+            sp_type=self.main_sp_type if not use_full_blocks_sp else SequenceParallelType.FullBlocksSP
         )
 
         # text
         text = self.text_embedding(text)
 
-        # 最终还原postprocess的shard_seq_lens和cp_type
-        if self.final_cp_type == ContextParallelType.CP:
+        # final shard_seq_lens and sp_type for postprocess
+        if self.final_sp_type == SequenceParallelType.SP:
             final_shard_seq_lens = full_shard_seq_lens
-        elif self.final_cp_type == ContextParallelType.FullBlocksCP:
+        elif self.final_sp_type == SequenceParallelType.FullBlocksSP:
             final_shard_seq_lens = full_block_full_shard_seq_lens
         for idx, block in enumerate(self.blocks):
-            # 如果是full2skiparse block，且采用了full blocks cp
-            # 需要先在full blocks cp group中得到完整序列，再重新在cp group中shard
-            if use_full_blocks_cp:
-                # 不是第一个block，且从full切换到sparse，则重新切分
+            # if the current block is full2skiparse block and full blocks sp is used,
+            # we need to first get the complete sequence in the full blocks sp group, and then shard in the sp group
+            if use_full_blocks_sp:
+                # if the current block is not the first block and the current block is full2skiparse block, then re-split
                 if idx != 0 and block.is_full2skiparse_block:
-                    x = self.context_preprocessor.postprocess(
-                        x, grid_sizes, shard_seq_lens=full_block_full_shard_seq_lens, cp_type=ContextParallelType.FullBlocksCP
+                    x = self.sequence_preprocessor.postprocess(
+                        x, grid_sizes, shard_seq_lens=full_block_full_shard_seq_lens, sp_type=SequenceParallelType.FullBlocksSP
                     )
-                    x, sub_grid_sizes = self.context_preprocessor.preprocess(
-                        x, grid_sizes, cp_type=self.main_cp_type
+                    x, sub_grid_sizes = self.sequence_preprocessor.preprocess(
+                        x, grid_sizes, sp_type=self.main_sp_type
                     )
 
             if block.skiparse_block_type == SkiparseBlockType.Full:
                 attn_mask, cross_attn_mask = None, None
-                shard_seq_lens = full_shard_seq_lens if not use_full_blocks_cp else full_block_full_shard_seq_lens
-            elif block.skiparse_block_type == SkiparseBlockType.Single:
+                shard_seq_lens = full_shard_seq_lens if not use_full_blocks_sp else full_block_full_shard_seq_lens
+            elif block.skiparse_block_type == SkiparseBlockType.Token:
                 attn_mask, cross_attn_mask, shard_seq_lens = global_single_mask, local_single_mask, single_shard_seq_lens
             elif block.skiparse_block_type == SkiparseBlockType.Group:
                 attn_mask, cross_attn_mask, shard_seq_lens = global_group_mask, local_group_mask, group_shard_seq_lens
@@ -1342,26 +1320,26 @@ class OSPNextModel(ModelMixin, ConfigMixin):
                 gradient_checkpointing=self.gradient_checkpointing,
             )
 
-            # 如果是skiparse2full block，且采用了full blocks cp
-            # 需要先在cp group中得到完整序列，再重新在full blocks cp group中shard
-            if use_full_blocks_cp:
-                # 不是最后一个block，后续还有full blocks，则重新切分
+            # if the current block is skiparse2full block and full blocks sp is used,
+            # we need to first get the complete sequence in the sp group, and then shard in the full blocks sp group
+            if use_full_blocks_sp:
+                # if the current block is not the last block and the current block is skiparse2full block, then re-split
                 if idx != len(self.blocks) - 1 and block.is_skiparse2full_block:
-                    x = self.context_preprocessor.postprocess(
-                        x, grid_sizes, shard_seq_lens=full_shard_seq_lens, cp_type=self.main_cp_type
+                    x = self.sequence_preprocessor.postprocess(
+                        x, grid_sizes, shard_seq_lens=full_shard_seq_lens, sp_type=SequenceParallelType.FullBlocksSP
                     )
-                    x, sub_grid_sizes = self.context_preprocessor.preprocess(
-                        x, grid_sizes, cp_type=ContextParallelType.FullBlocksCP
+                    x, sub_grid_sizes = self.sequence_preprocessor.preprocess(
+                        x, grid_sizes, sp_type=self.main_sp_type
                     )
 
         # head
         x = self.head(x, e)
 
-        # 根据final_shard_seq_lens和final_cp_type还原序列
-        x = self.context_preprocessor.postprocess(
+        # restore sequences according to final_shard_seq_lens and final_sp_type
+        x = self.sequence_preprocessor.postprocess(
             x, grid_sizes, 
             shard_seq_lens=final_shard_seq_lens, 
-            cp_type=self.final_cp_type
+            sp_type=self.final_sp_type
         )
 
         # unpatchify

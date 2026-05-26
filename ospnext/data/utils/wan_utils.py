@@ -9,25 +9,6 @@ from .utils import AbstractDataProcessor, AbstractDataFilter, TextProcessor, rea
 from .video_reader import VideoReader, video_reader_contextmanager
 from .image_reader import ImageReader
 
-class StartFrameNoiseAdder:
-    def __init__(self, mean=-3.0, std=0.5):
-        self.mean = mean
-        self.std = std
-
-    def __call__(self, start_frame): # C T H W
-        if start_frame.ndim == 5:
-            batch_size = start_frame.shape[0]
-        else:
-            batch_size = 1
-        noise_sigma = torch.normal(
-            mean=self.mean, std=self.std, size=(batch_size,), device=start_frame.device
-        )
-        noise_sigma = torch.exp(noise_sigma)
-        while noise_sigma.ndim < start_frame.ndim:
-            noise_sigma = noise_sigma.unsqueeze(-1)
-        start_frame = start_frame + torch.randn_like(start_frame) * noise_sigma
-        return start_frame
-
 class WanTextProcessor(TextProcessor):
 
     def __init__(
@@ -338,51 +319,3 @@ class WanVideoProcessor(AbstractDataProcessor):
         if need_processing:
             sample = self.process_one_sample(sample)
         return sample
-
-
-class WanImageProcessor(AbstractDataProcessor):
-    def __init__(
-        self,
-        image_layout_type='CHW',
-        sample_height=480,
-        sample_width=832,
-    ):
-        super().__init__()
-        self.image_reader = ImageReader
-        self.image_layout_type = image_layout_type
-        
-        self.sample_height = sample_height
-        self.sample_width = sample_width
-
-        self.image_transforms = Compose(
-            [
-                CenterCropResizeVideo((self.sample_height, self.sample_width), interpolation_mode='bicubic', align_corners=False, antialias=True),
-                ToTensorAfterResize(),
-                AENorm()
-            ]
-        )
-        
-        print(f'image_transforms: \n {self.image_transforms}')
-
-    def read_one_sample(self, path, meta_info=None):
-        sample = self.image_reader(path, self.image_layout_type).load_image()
-        return sample
-
-    def process_one_sample(self, sample):
-        if self.image_layout_type == "CHW":
-            # add T dimension
-            sample = sample.unsqueeze(1)
-            sample = self.image_transforms(sample)
-        elif self.image_layout_type == "HWC":
-            sample = sample.unsqueeze(0)
-            sample = sample.permute(0, 3, 1, 2) # (1 H W C) -> (1 C H W)
-            sample = self.image_transforms(sample)
-            sample = sample.permute(0, 2, 3, 1) # (1 C H W) -> (1 H W C)
-        return sample
-
-    def __call__(self, image_path, meta_info=None, need_processing=True):
-        sample = self.read_one_sample(image_path, meta_info)
-        if need_processing:
-            sample = self.process_one_sample(sample)
-        return sample
-        

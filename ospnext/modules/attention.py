@@ -220,9 +220,6 @@ def flash_attn_no_pad(
     no_mask_q = mask_q is None
     no_mask_kv = mask_kv is None
 
-    # ==================================================================
-    # Case 1: 完全无 mask
-    # ==================================================================
     if (is_cross_attn and no_mask_kv) or (no_mask_q and no_mask_kv):
         if not is_cross_attn: # self-attn
             qkv = torch.stack([q, k, v], dim=2)
@@ -242,10 +239,6 @@ def flash_attn_no_pad(
                 deterministic=deterministic,
             )
 
-    # ==================================================================
-    # Case 2: 有 mask → 只 unpad 有 mask 的一侧
-    # ==================================================================
-    # --- 特殊路径: self-attn + 有 mask → qkvpacked ---
     if not is_cross_attn and not no_mask_q:
         qkv = torch.cat([q, k, v], dim=2)
         x = rearrange(qkv, "b s three_h d -> b s (three_h d)")
@@ -269,8 +262,6 @@ def flash_attn_no_pad(
         )
         return output
 
-    # --- 通用路径: cross-attn 或 mask 不同 ---
-    # Q 侧
     if no_mask_q:
         q_unpad = rearrange(q, "b s h d -> (b s) h d")
         indices_q = None
@@ -285,7 +276,6 @@ def flash_attn_no_pad(
         )
         q_unpad = rearrange(q_unpad, "nnz (h d) -> nnz h d", h=num_heads)
 
-    # KV 侧
     if no_mask_kv:
         k_unpad = rearrange(k, "b s h d -> (b s) h d")
         v_unpad = rearrange(v, "b s h d -> (b s) h d")
@@ -353,24 +343,17 @@ def flash_attn_no_pad_v3(
     no_mask_q = mask_q is None
     no_mask_kv = mask_kv is None
 
-    # ==================================================================
-    # Case 1: 完全无 mask → 不需要 unpad
-    # 特别地，如果是 cross-attn，并且 KV 侧无 mask，则直接走 FA3 定长算子，避免 unpad 和 pad 的额外开销
-    # ==================================================================
     if (is_cross_attn and no_mask_kv) or (no_mask_q and no_mask_kv):
-        output, _ = flash_attn_func_v3(
+        output = flash_attn_func_v3(
             q, k, v,
             softmax_scale=softmax_scale,
             causal=causal,
             deterministic=deterministic,
         )
+        if isinstance(output, tuple):
+            output = output[0]
         return output
 
-    # ==================================================================
-    # Case 2: 有 mask → 按需 unpad（只 unpad 有 mask 的一侧）
-    # ==================================================================
-
-    # --- self-attn + 有mask -> qkv一起cat再拆分，避免重复unpad ---
     if not is_cross_attn:
         qkv = torch.cat([q, k, v], dim=2)
         x = rearrange(qkv, "b s three_h d -> b s (three_h d)")
@@ -380,7 +363,7 @@ def flash_attn_no_pad_v3(
             three=3, h=num_heads,
         )
         q_unpad, k_unpad, v_unpad = x_unpad.unbind(dim=1)
-        output_unpad, _ = flash_attn_varlen_func_v3(
+        output_unpad = flash_attn_varlen_func_v3(
             q_unpad, k_unpad, v_unpad,
             cu_seqlens_q, cu_seqlens_q,
             max_seqlen_q, max_seqlen_q,
@@ -388,8 +371,9 @@ def flash_attn_no_pad_v3(
             causal=causal,
             deterministic=deterministic,
         )
+        if isinstance(output_unpad, tuple):
+            output_unpad = output_unpad[0]
     else:
-        # ---- 处理 Q 侧 ----
         if no_mask_q:
             q_unpad = rearrange(q, "b s h d -> (b s) h d")
             indices_q = None
@@ -404,7 +388,6 @@ def flash_attn_no_pad_v3(
             )
             q_unpad = rearrange(q_unpad, "nnz (h d) -> nnz h d", h=num_heads)
 
-        # ---- 处理 KV 侧 ----
         if no_mask_kv:
             k_unpad = rearrange(k, "b s h d -> (b s) h d")
             v_unpad = rearrange(v, "b s h d -> (b s) h d")
@@ -423,8 +406,7 @@ def flash_attn_no_pad_v3(
             k_unpad = rearrange(k_unpad, "nnz (h d) -> nnz h d", h=num_heads_kv)
             v_unpad = rearrange(v_unpad, "nnz (h d) -> nnz h d", h=num_heads_kv)
 
-        # ---- Flash Attention V3 计算 ----
-        output_unpad, _ = flash_attn_varlen_func_v3(
+        output_unpad = flash_attn_varlen_func_v3(
             q_unpad, k_unpad, v_unpad,
             cu_seqlens_q, cu_seqlens_kv,
             max_seqlen_q, max_seqlen_kv,
@@ -432,8 +414,9 @@ def flash_attn_no_pad_v3(
             causal=causal,
             deterministic=deterministic,
         )
+        if isinstance(output_unpad, tuple):
+            output_unpad = output_unpad[0]
 
-    # ---- 恢复 output 形状 ----
     if indices_q is not None:
         output = rearrange(
             pad_input(
@@ -462,9 +445,9 @@ def scaled_dot_product_attention_with_mask(
     if attn_mask is not None:
         if attn_mask.dtype != torch.bool:
             attn_mask = attn_mask.to(q.dtype)
-        # [B, N] -> [B, 1, 1, N]，作为 key 侧 mask
+        # [B, N] -> [B, 1, 1, N], used as the key-side mask
         attn_mask = attn_mask[:, None, None, :]
-        # NPU需要接受 [B, 1, Nq, Nkv] 形状的mask
+        # NPU requires a mask of shape [B, 1, Nq, Nkv]
         if is_npu_available():
             q_len = q.shape[2]
             attn_mask = attn_mask.expand(-1, -1, q_len, -1)
@@ -492,7 +475,7 @@ def attention_with_mask(
     k = k.to(dtype)
     v = v.to(dtype)
 
-    # ========== npu不支持flash attn接口，走SDPA ==========
+    # ========== NPU path uses SDPA ==========
     if is_npu_available() or (not FLASH_ATTN_2_AVAILABLE and not FLASH_ATTN_3_AVAILABLE):
         output = scaled_dot_product_attention_with_mask(
             q=q,
@@ -502,7 +485,7 @@ def attention_with_mask(
             causal=causal,
             dropout_p=dropout_p,
         )
-    # ========== 优先用 Flash Attention V3 ==========
+    # ========== Prefer Flash Attention V3 ==========
     elif FLASH_ATTN_3_AVAILABLE:
         output = flash_attn_no_pad_v3(
             q=q,
@@ -515,7 +498,7 @@ def attention_with_mask(
             softmax_scale=softmax_scale,
             deterministic=deterministic,
         )
-    # ========== 降级用 Flash Attention V2 ==========
+    # ========== Fall back to Flash Attention V2 ==========
     elif FLASH_ATTN_2_AVAILABLE:
         output = flash_attn_no_pad(
             q=q,

@@ -6,9 +6,8 @@
 from typing import Any, Tuple, List, Optional
 import torch
 import torch.distributed as dist
-
-from .cp_state import cp_state
 from torch.nn import functional as F
+
 from ospnext.utils.utils import contiguous
 
 
@@ -157,7 +156,7 @@ class SeqAllToAll4D(torch.autograd.Function):
             group=ctx.group,
             shard_seq_lens=ctx.shard_seq_lens,
         )
-        # 对应 forward 的 (group, input, scatter_idx, gather_idx, shard_seq_lens)
+        # Matches forward's signature: (group, input, scatter_idx, gather_idx, shard_seq_lens)
         return None, grad_input, None, None, None
 
 
@@ -228,18 +227,6 @@ def all_gather(input_: torch.Tensor, dim: int = 1, group=None):
 
 
 class _AllToAllSingle(torch.autograd.Function):
-    """All-to-all-single communication with autograd support.
-
-    Forward:
-        将 input_ 沿 dim 维按 input_split_sizes 切分, 第 i 块发给 rank i;
-        从各 rank 收到的块按 output_split_sizes 拼接到 dim 维.
-
-    Backward:
-        对 grad_output 做一次 "逆向" all_to_all_single:
-        将 grad_output 沿 dim 按 (前向的 output_split_sizes) 切分发回,
-        按 (前向的 input_split_sizes) 接收, 还原为 grad_input.
-    """
-
     @staticmethod
     def forward(
         ctx,
@@ -263,7 +250,7 @@ class _AllToAllSingle(torch.autograd.Function):
             out_size = list(inp.shape)
             out_size[0] = sum(output_split_sizes)
         else:
-            out_size = list(inp.shape)          # 等分时输出与输入同形
+            out_size = list(inp.shape)          
 
         output = torch.empty(out_size, dtype=inp.dtype, device=inp.device)
 
@@ -285,8 +272,8 @@ class _AllToAllSingle(torch.autograd.Function):
         group = ctx.group
         dim = ctx.dim
 
-        bwd_output_split_sizes = ctx.input_split_sizes   # 反向的 recv sizes = 前向的 send sizes
-        bwd_input_split_sizes = ctx.output_split_sizes    # 反向的 send sizes = 前向的 recv sizes
+        bwd_output_split_sizes = ctx.input_split_sizes   
+        bwd_input_split_sizes = ctx.output_split_sizes    
 
         if dim != 0:
             grad_output = grad_output.transpose(0, dim)

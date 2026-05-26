@@ -7,7 +7,7 @@ import torch.distributed as dist
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines import DiffusionPipeline
 from ospnext.utils.constant import NEGATIVE_PROMPT
-from ospnext.distributed.cp_state import cp_state
+from ospnext.distributed.sp_state import sp_state
 
 class T2VInferencePipeline(DiffusionPipeline):
 
@@ -138,12 +138,12 @@ class T2VInferencePipeline(DiffusionPipeline):
             latents = latents * self.scheduler.init_noise_sigma
 
         if (
-            cp_state.is_initialized
-            and cp_state.global_cp_group is not None
-            and cp_state.global_cp_size > 1
+            sp_state.is_initialized
+            and sp_state.global_sp_group is not None
+            and sp_state.global_sp_size > 1
             and dist.is_initialized()
         ):
-            dist.broadcast(latents, group_src=0, group=cp_state.global_cp_group)
+            dist.broadcast(latents, group_src=0, group=sp_state.global_sp_group)
         return latents
 
     def decode_latents(self, latents, value_range=(-1, 1), normalize=True, **kwargs):

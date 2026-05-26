@@ -133,5 +133,4 @@ class SafeCacheManager:
         self._evict_if_needed()
 
     def clear(self):
-        """清空缓存"""
         self.cache.clear()

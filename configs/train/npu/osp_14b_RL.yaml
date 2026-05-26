@@ -1,98 +1,99 @@
-cp_size: 2
-data_config:
-    batch_size: 1
-    collator_name: wan_t2v
-    dataset_config:
-        metafile_or_dir_path: /home/ma-user/work/data/osp-yuan/hq_videos_81f720p/filtered_samples_2572816.lmdb
-        return_prompt_mask: true
-        sample_height: 720
-        sample_num_frames: 81
-        sample_width: 1280
-        text_drop_ratio: 0.1
-        text_tokenizer_path: /home/ma-user/work/gyy/ospnext/Wan2.1-T2V-14B/google/umt5-xxl
-        tokenizer_max_length: 512
-        train_fps: 16
-    dataset_name: wan_t2v
-    drop_last: true
-    num_workers: 16
-    pin_memory: false
-    sampler_name: stateful_distributed
-    shuffle: true
-ema_decay: 0.9993
-ema_update_interval: 1
-explicit_prefetching_num_blocks: 0
+model_name: "osp_next"
+seed: 42
+
+output_dir: "/path/to/output"
+
+num_epochs: 1000
+# ddp_size: 1
 fsdp_size: 16
+sp_size: 4
+skiparse_sp_size: 4
+use_sequence_parallel: False
+use_skiparse_sequence_parallel: True
+reshard_after_forward: Null
+explicit_prefetching_num_blocks: 0
+gradient_checkpointing: True
 gradient_accumulation_steps: 1
-gradient_checkpointing: true
 init_max_grad_norm: 1.0
 log_interval: 1
-model_cpu_offload: True
-model_config:
-    dim: 5120
-    ffn_dim: 13824
-    freq_dim: 256
-    in_dim: 16
-    num_full_blocks: 8
-    num_heads: 40
-    num_layers: 40
-    num_register_tokens: 0
-    out_dim: 16
-    # HIF8 quantization settings
-    # Set quant to "hif8" to enable quantization simulation on Q/K/V/O and FFN linears.
-    # Set to null (or omit) to use plain nn.Linear.
-    # quant: "hif8"
-    # quant_attn: "hif8"
-    # scale_max_forward: 15.0    # forward activation scale clamp (HIF8 max ≈ 15)
-    # scale_max_backward: 224.0  # backward gradient scale clamp  (HIF8 max ≈ 224)
-    pretrained_model_dir_or_checkpoint: /home/ma-user/work/gyy/ospnext/output/osp_next_14b_81f720p_sparse2d2_ssp4/iter_000006000/ema_model_state_dict.pt
-    skiparse_1d: false
-    skiparse_2d: true
-    skiparse_model_type: dual_end
-    sparse_ratio: 2
-    text_len: 512
-model_name: osp_next
-optimizer_config:
-    lr: 1.0e-4
-    # resume_lr: 1.0e-4
-    weight_decay: 0.001
-output_dir: output/osp_next_14b_lr1e_5_81f720p_sparse2d2_sp2_ssp4_grpo4_node7_lr1e04_bf16
-profiling: false
-reshard_after_forward: Null
-save_interval: 1
-save_with_dcp_api: true
-scheduler_config:
-    scheduler_name: flow_matching
-    shift: 7.5
-    use_logitnorm_time_sampling: true
-seed: 1024
-skiparse_cp_size: 4
-text_encoder_config:
-    checkpoint_path: /home/ma-user/work/gyy/ospnext/Wan2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth
-    text_len: 512
-    use_fsdp: true
-training_iteration: 1000000
-use_context_parallel: false
-use_skiparse_context_parallel: true
-vae_config:
-    dtype: fp32
-    vae_path: /home/ma-user/work/gyy/ospnext/Wan2.1-T2V-14B/Wan2.1_VAE.pth
-wandb_config:
-    exp_name: osp_next_14b_lr1e_5_81f720p_sparse2d2_sp2_ssp4_bf16
-    project_name: osp_next_RL_14b
-weight_dtype: bf16
+save_interval: 500
+weight_dtype: "bf16"
+ema_decay: 0.999 # 0.999 is used for the 14B model
+ema_update_interval: 1
+save_with_dcp_api: True
+model_cpu_offload: False
+encoder_cpu_offload: False
+profiling: False
 
-# resume_epoch: 15
+wandb_config:
+  project_name: "osp_next_RL"
+  exp_name: "osp_next_RL"
+
+model_config:
+  dim: 5120
+  ffn_dim: 13824
+  freq_dim: 256
+  in_dim: 16
+  num_heads: 40
+  num_layers: 40
+  out_dim: 16
+  text_len: 512
+  skiparse_model_type: "dual_end"
+  sparse_ratio: 2
+  num_full_blocks: 8
+  pretrained_model_dir_or_checkpoint: "/path/to/model"
+
+scheduler_config:
+  scheduler_name: "flow_matching"
+  use_dynamic_shifting: True
+  use_logitnorm_time_sampling: True
+
+vae_config:
+  vae_path: "/path/to/vae"
+  dtype: "fp16"
+
+text_encoder_config:
+  text_len: 512
+  checkpoint_path: "/path/to/text_encoder"
+  text_tokenizer_path: "/path/to/tokenizer"
+  use_fsdp: True
+
+# RL training uses a text-only prompt dataset, only the tokenizer is needed here.
+data_config:
+  dataset_config:
+    text_tokenizer_path: "/path/to/tokenizer"
+    tokenizer_max_length: 512
+
+optimizer_config:
+  lr: 0.00002 # 2e-5
+  weight_decay: 0.001 # 1e-3
+
+lora_config:
+  rank: 32
+  alpha: 64
+  target_modules:
+    - "self_attn.q"
+    - "self_attn.k"
+    - "self_attn.v"
+    - "self_attn.o"
+    - "cross_attn.q"
+    - "cross_attn.k"
+    - "cross_attn.v"
+    - "cross_attn.o"
+  # lora_path: "/path/to/existing/lora"  # set to resume from an existing LoRA checkpoint
 
 rl_config:
-  prompt_file: "/home/ma-user/work/xianyi/osp_next/dataset/vbench/vbench_train.txt"
-  eval_prompt_file: "/home/ma-user/work/xianyi/osp_next/dataset/vbench/sora_test.txt"
+  prompt_file: "/path/to/prompt_file"
+  eval_prompt_file: "/path/to/eval_prompt_file"
+  height: 720
+  width: 1280
+  num_frames: 81
   sde_steps: 10
   num_inference_steps: 25
   kl_beta: 0.004
   num_batches_per_epoch: 4
-  num_image_per_prompt: 4 
+  num_image_per_prompt: 4
   sample_batch_size: 2
   train_batch_size: 2
-  reward_fn: 
+  reward_fn:
     videoalign: 1.0
-  

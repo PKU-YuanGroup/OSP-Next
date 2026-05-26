@@ -4,8 +4,8 @@ model_name: "osp_next"
 pipeline_name: "t2v"
 seed: 1024
 
-prompt_txt: "assets/t2v/MovieGenVideoBench_rewritten.txt"
-output_dir: "samples/osp_next_1_3b_81f480p_sparse2d2_ssp2/iter_000010000_ema_moviegen_rewritten"
+prompt_txt: "assets/t2v/simple_prompts.txt"
+output_dir: "/path/to/output"
 
 num_frames: 81
 height: 480
@@ -14,10 +14,10 @@ save_fps: 16
 batch_size: 1
 
 fsdp_size: 4
-cp_size: 4
-skiparse_cp_size: 2
-use_context_parallel: False
-use_skiparse_context_parallel: True
+sp_size: 4
+skiparse_sp_size: 2
+use_sequence_parallel: False
+use_skiparse_sequence_parallel: True
 reshard_after_forward: False
 weight_dtype: "bf16"
 save_with_dcp_api: False
@@ -34,10 +34,7 @@ model_config:
   skiparse_model_type: "dual_end"
   sparse_ratio: 2
   num_full_blocks: 8
-  num_register_tokens: 0
-  skiparse_1d: False
-  skiparse_2d: True
-  pretrained_model_dir_or_checkpoint: "output/osp_next_1_3b_81f480p_sparse2d2_ssp2/iter_000010000/ema_model_state_dict.pt"
+  pretrained_model_dir_or_checkpoint: "/path/to/model"
 
 scheduler_config:
   scheduler_name: "flow_matching"
@@ -46,11 +43,11 @@ scheduler_config:
   guidance_scale: 5.0
 
 vae_config:
-  vae_path: "Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"
+  vae_path: "/path/to/vae"
   dtype: "fp16"
 
 text_encoder_config:
   text_len: 512
-  checkpoint_path: "Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth"
-  text_tokenizer_path: "Wan2.1-T2V-1.3B/google/umt5-xxl"
+  checkpoint_path: "/path/to/text_encoder"
+  text_tokenizer_path: "/path/to/text_tokenizer"
   use_fsdp: True

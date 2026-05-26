@@ -4,8 +4,8 @@ model_name: "osp_next"
 pipeline_name: "t2v"
 seed: 1024
 
-prompt_txt: "assets/t2v/MovieGenVideoBench_rewritten.txt"
-output_dir: "samples/hif8/osp_next_14b_81f720p_sparse2d2_ssp4_from_full/iter_000006000_ema"
+prompt_txt: "assets/t2v/simple_prompts.txt"
+output_dir: "/path/to/output"
 
 num_frames: 81
 height: 720
@@ -14,10 +14,10 @@ save_fps: 16
 batch_size: 1
 
 fsdp_size: 8
-cp_size: 2
-skiparse_cp_size: 4
-use_context_parallel: False
-use_skiparse_context_parallel: True
+sp_size: 2
+skiparse_sp_size: 4
+use_sequence_parallel: False
+use_skiparse_sequence_parallel: True
 reshard_after_forward: Null
 explicit_prefetching_num_blocks: 0
 weight_dtype: "bf16"
@@ -35,9 +35,6 @@ model_config:
   skiparse_model_type: "dual_end"
   sparse_ratio: 2
   num_full_blocks: 8
-  num_register_tokens: 0
-  skiparse_1d: False
-  skiparse_2d: True
   # HIF8 quantization settings
   # Set quant to "hif8" to enable quantization simulation on Q/K/V/O and FFN linears.
   # Set to null (or omit) to use plain nn.Linear.
@@ -45,7 +42,7 @@ model_config:
   quant_attn: "hif8"
   scale_max_forward: 15.0    # forward activation scale clamp (HIF8 max ≈ 15)
   scale_max_backward: 224.0  # backward gradient scale clamp  (HIF8 max ≈ 224)
-  pretrained_model_dir_or_checkpoint: "output/hif8/osp_next_14b_81f720p_sparse2d2_ssp4_from_full/iter_000006000/ema_model_state_dict.pt"
+  pretrained_model_dir_or_checkpoint: "/path/to/model"
 
 scheduler_config:
   scheduler_name: "flow_matching"
@@ -54,11 +51,11 @@ scheduler_config:
   guidance_scale: 5.0
 
 vae_config:
-  vae_path: "Wan2.1-T2V-14B/Wan2.1_VAE.pth"
+  vae_path: "/path/to/vae"
   dtype: "fp16"
 
 text_encoder_config:
   text_len: 512
-  checkpoint_path: "Wan2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth"
-  text_tokenizer_path: "Wan2.1-T2V-14B/google/umt5-xxl"
+  checkpoint_path: "/path/to/text_encoder"
+  text_tokenizer_path: "/path/to/text_tokenizer"
   use_fsdp: True

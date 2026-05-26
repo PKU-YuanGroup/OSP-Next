@@ -47,13 +47,14 @@ def get_latest_checkpoint_folder(path):
 
 
 class Checkpointer:
-    def __init__(self, folder: str, dcp_api: bool):
+    def __init__(self, folder: str = None, dcp_api: bool = False):
         self.folder = folder
         self.dcp_api = dcp_api
-        self.save_root_dir = folder
-        self._last_training_iteration = get_latest_checkpoint_folder(
-            self.save_root_dir
-        )
+        if folder is not None:
+            self.save_root_dir = folder
+            self._last_training_iteration = get_latest_checkpoint_folder(
+                self.save_root_dir
+            )
 
     @property
     def last_training_iteration(self):

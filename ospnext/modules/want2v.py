@@ -10,11 +10,7 @@ from einops import rearrange
 from torch.distributed.tensor import Shard, Replicate
 from ospnext.utils.utils import is_npu_available
 
-from ospnext.distributed.redistribution import Redistribution
-
-
 from .attention import flash_attention, attention
-
 
 T5_CONTEXT_TOKEN_NUMBER = 512
 
@@ -130,9 +126,6 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-        # cp dummy layers
-        self.cp_self_attn_before_attention_layer = nn.Identity()
-        self.cp_self_attn_after_attention_layer = nn.Identity()
 
     def forward(self, x, seq_lens, grid_sizes, freqs):
         r"""
@@ -153,11 +146,6 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
         
-        # maybe we need cp
-        q = self.cp_self_attn_before_attention_layer(q)
-        k = self.cp_self_attn_before_attention_layer(k)
-        v = self.cp_self_attn_before_attention_layer(v)
-
         attention_func = flash_attention if not is_npu_available() else attention
 
         x = attention_func(
@@ -168,9 +156,6 @@ class WanSelfAttention(nn.Module):
             window_size=self.window_size,
         )
 
-        # maybe we need cp
-        x = self.cp_self_attn_after_attention_layer(x)
-
         # output
         x = x.flatten(2)
         x = self.o(x)
@@ -178,11 +163,6 @@ class WanSelfAttention(nn.Module):
 
 
 class WanT2VCrossAttention(WanSelfAttention):
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.cp_cross_attn_before_attention_layer = nn.Identity()
-        self.cp_cross_attn_after_attention_layer = nn.Identity()
 
     def forward(self, x, context, context_lens):
         r"""
@@ -198,23 +178,14 @@ class WanT2VCrossAttention(WanSelfAttention):
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
 
-        # maybe we need cp
-        q = self.cp_cross_attn_before_attention_layer(q)
-        k = self.cp_cross_attn_before_attention_layer(k)
-        v = self.cp_cross_attn_before_attention_layer(v)
-
         # compute attention
         attention_func = flash_attention if not is_npu_available() else attention
         x = attention_func(q, k, v, k_lens=context_lens)
 
-        # maybe we need cp
-        x = self.cp_cross_attn_after_attention_layer(x)
-        
         # output
         x = x.flatten(2)
         x = self.o(x)
         return x
-
 
 
 class WanAttentionBlock(nn.Module):
@@ -445,10 +416,6 @@ class WanModel(ModelMixin, ConfigMixin):
         self.rope_d = dim // num_heads
         self.freqs = None
 
-        # cp dummy layers
-        self.cp_input_layer = nn.Identity()
-        self.cp_output_layer = nn.Identity()
-
         # initialize weights
         self.init_weights()
 
@@ -496,15 +463,11 @@ class WanModel(ModelMixin, ConfigMixin):
         e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
         e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
-        # 当前实现下只支持batch内等长，无padding的情况
+        # Current implementation only supports equal-length samples within a batch (no padding).
         x, grid_sizes = self.patchify(x)
         seq_lens = torch.tensor(math.prod(grid_sizes), dtype=torch.long, device=device).repeat(x.size(0))
         grid_size_for_rope = torch.tensor(grid_sizes, dtype=torch.long, device=device).unsqueeze(0).repeat(x.size(0), 1)
         
-        # maybe we need cp
-        x = self.cp_input_layer(x)
-        context = self.cp_input_layer(context)
-
         # context
         context_lens = None
         context = self.text_embedding(context)
@@ -519,8 +482,6 @@ class WanModel(ModelMixin, ConfigMixin):
             args[0] = x
         # head
         x = self.head(x, e)
-
-        x = self.cp_output_layer(x)
 
         # unpatchify
         x = self.unpatchify(x, *grid_sizes)
@@ -549,31 +510,6 @@ class WanModel(ModelMixin, ConfigMixin):
         )
         return patch_out
 
-
-    # def init_weights(self):
-    #     r"""
-    #     Initialize model parameters using Xavier initialization.
-    #     """
-
-    #     # basic init
-    #     for m in self.modules():
-    #         if isinstance(m, nn.Linear):
-    #             nn.init.xavier_uniform_(m.weight)
-    #             if m.bias is not None:
-    #                 nn.init.zeros_(m.bias)
-
-    #     # init embeddings
-    #     nn.init.xavier_uniform_(self.patch_embedding.weight.flatten(1))
-    #     for m in self.text_embedding.modules():
-    #         if isinstance(m, nn.Linear):
-    #             nn.init.normal_(m.weight, std=0.02)
-    #     for m in self.time_embedding.modules():
-    #         if isinstance(m, nn.Linear):
-    #             nn.init.normal_(m.weight, std=0.02)
-
-    #     # init output layer
-    #     nn.init.zeros_(self.head.head.weight)
-
     def init_weights(self):
         for n, m in self.named_modules():
             if n == "":
@@ -597,41 +533,6 @@ models_blocks_to_float = {
 
 models_blocks_to_output_float = {
     "wan_t2v": None
-}
-
-cp_plans = {
-    "wan_t2v": {
-        WanModel:{
-            "cp_input_layer": Redistribution(
-                original_layouts=(Replicate(),),
-                target_layouts=(Shard(1),), # split on sequence dim, (B, N, C) -> (B, N / cp_size, C)
-            ),
-            "cp_output_layer": Redistribution(
-                original_layouts=(Shard(1),),
-                target_layouts=(Replicate(),), # gather on sequence dim, (B, N / cp_size, C) -> (B, N, C)
-            ),
-        },
-        WanSelfAttention: {
-            "cp_self_attn_before_attention_layer": Redistribution(
-                original_layouts=(Shard(1),), 
-                target_layouts=(Shard(2),), # all to all, (B, N / cp_size, H, D) -> (B, N, H / cp_size, D)
-            ),
-            "cp_self_attn_after_attention_layer": Redistribution(
-                original_layouts=(Shard(2),),
-                target_layouts=(Shard(1),), # all to all, (B, N, H / cp_size, D) -> (B, N / cp_size, H, D)
-            ),
-        },
-        WanT2VCrossAttention: {
-            "cp_cross_attn_before_attention_layer": Redistribution(
-                original_layouts=(Shard(1),), 
-                target_layouts=(Shard(2),), # all to all, (B, N / cp_size, H, D) -> (B, N, H / cp_size, D)
-            ),
-            "cp_cross_attn_after_attention_layer": Redistribution(
-                original_layouts=(Shard(2),),
-                target_layouts=(Shard(1),), # all to all, (B, N, H / cp_size, D) -> (B, N / cp_size, H, D)
-            ),
-        }
-    }
 }
 
 if __name__ == "__main__":

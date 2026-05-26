@@ -28,7 +28,7 @@ import torch.nn.functional as F
 # NPU operator import (placeholder until the actual op package is available)
 # ---------------------------------------------------------------------------
 try:
-    from ospnext.quant_cy_npu import QType, quant_dequant_float  # 这里需要编译那个quant_cy_npu算子之后才能import;  编译方法： 解压后， 直接  bash build.sh
+    from ospnext.quant_cy_npu import QType, quant_dequant_float  # Requires building the quant_cy_npu kernel first; build steps: unzip, then run `bash build.sh`.
 except ImportError:
     # Temporary stub so the code can be imported without the real op.
     # Replace with the real import once hif8_ops is installed.
@@ -45,8 +45,8 @@ def _quant(x: torch.Tensor, scale_max: float) -> tuple:
     x_max = x.abs().amax().clamp(min=1e-8)                                  
     scale = scale_max / x_max
     scaled_x = x * scale
-    x_q = quant_dequant_float(scaled_x, qtype, force_fp32=True) / scale      # 最终经过量化-反量化处理的tensor，  用于后续linear或者attention
-    # quant_dequant_float 输出数据类型是FP32， 后续根据需要决定是否加 .to(torch.bfloat16)
+    x_q = quant_dequant_float(scaled_x, qtype, force_fp32=True) / scale      # Final quantize-dequantize'd tensor, used by downstream linear or attention ops.
+    # quant_dequant_float returns FP32; cast with .to(torch.bfloat16) downstream when needed.
     return x_q, scale
 
 

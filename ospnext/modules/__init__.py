@@ -8,7 +8,6 @@ from .want2v import (
     models_main_block as wan_models_main_block, 
     models_blocks_to_float as wan_models_blocks_to_float,
     models_blocks_to_output_float as wan_models_blocks_to_output_float,
-    cp_plans as wan_cp_plans
 )
 
 from .osp_next import (
@@ -34,10 +33,6 @@ models_blocks_to_output_float = {}
 models_blocks_to_output_float.update(wan_models_blocks_to_output_float)
 models_blocks_to_output_float.update(osp_next_models_blocks_to_output_float)
 
-models_cp_plans = {}
-models_cp_plans.update(wan_cp_plans)
-
-
 __all__ = [
     'WanVAE',
     'T5Model',
@@ -49,6 +44,5 @@ __all__ = [
     'models_main_block',
     'models_blocks_to_float',
     'models_blocks_to_output_float',
-    'models_cp_plans',
     'flash_attention',
 ]

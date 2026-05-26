@@ -1,5 +1,5 @@
 import torch
-from ospnext.utils.constant import VIDEO, PROMPT, PROMPT_IDS, PROMPT_MASK, START_FRAME, NAME_INDEX
+from ospnext.utils.constant import VIDEO, PROMPT_IDS, PROMPT_MASK
 
 class WanDataCollator:
     def __init__(self, *args, **kwargs):
@@ -16,35 +16,6 @@ class WanDataCollator:
             PROMPT_MASK: prompt_mask,
         }
     
-
-class T2VEvalDataCollator:
-    def __init__(self, *args, **kwargs):
-        pass
-    
-    def __call__(self, batch):
-        prompt = [i[PROMPT] for i in batch]
-        name_index = [i[NAME_INDEX] for i in batch]
-        return {
-            PROMPT: prompt,
-            NAME_INDEX: name_index
-        }
-    
-class I2VEvalDataCollator:
-    def __init__(self, *args, **kwargs):
-        pass
-    
-    def __call__(self, batch):
-        start_frame = [i[START_FRAME] for i in batch]
-        prompt = [i[PROMPT] for i in batch]
-        name_index = [i[NAME_INDEX] for i in batch]
-        return {
-            START_FRAME: start_frame,
-            PROMPT: prompt,
-            NAME_INDEX: name_index
-        }
-
 data_collator = {
     'wan_t2v': WanDataCollator,
-    't2v_eval': T2VEvalDataCollator,
-    'i2v_eval': I2VEvalDataCollator
 }

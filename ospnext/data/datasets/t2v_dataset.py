@@ -1,6 +1,3 @@
-# Copyright (c) 2024 Huawei Technologies Co., Ltd.
-
-
 import os
 import torch    
 import random
@@ -18,11 +15,6 @@ T2VOutputData = {
     PROMPT_IDS: None,
     PROMPT_MASK: None,
     VIDEO: None,
-}
-
-T2VEvalOutputData = {
-    PROMPT: None,
-    NAME_INDEX: None,
 }
 
 class WanT2VDataset(BaseDataset):
@@ -84,7 +76,7 @@ class WanT2VDataset(BaseDataset):
         self.timeout = kwargs.get("timeout", 600)
 
     def _get_data_length(self):
-        # 临时开一个 reader 获取长度后关掉
+        # Temporarily open a reader to obtain the length, then close it.
         reader = LMDBReader(self.metafile_or_dir_path)
         length = len(reader)
         del reader
@@ -92,22 +84,22 @@ class WanT2VDataset(BaseDataset):
 
     @property
     def dataset_reader(self):
-        # 每个 worker 进程第一次访问时才创建自己的 reader
-        # NOTE 重要：LMDB存在线程不安全的问题，一定要在worker内部初始化
+        # Lazily create a per-worker reader on first access.
+        # IMPORTANT: LMDB is not thread-safe, so it must be initialized inside the worker.
         if self._dataset_reader is None:
             self._dataset_reader = LMDBReader(self.metafile_or_dir_path)
         return self._dataset_reader
 
     @property
     def executor(self):
-        # 每个进程第一次用到时才创建，fork 后各自独立初始化
+        # Lazily create per-process on first use; each forked process initializes its own.
         if self._executor is None:
             self._executor = ThreadPoolExecutor(max_workers=1)
         return self._executor
 
     def __getitem__(self, index):
         try:
-            future = self.executor.submit(self.getitem, index)  # 通过 property 访问
+            future = self.executor.submit(self.getitem, index)  # Access via property
             data = future.result(timeout=self.timeout)
             return data
         except Exception as e:
@@ -185,69 +177,7 @@ class T2VRandomDataset(BaseDataset):
         prompt_input_ids, prompt_mask = self.text_processor(text)
         return prompt_input_ids, prompt_mask
 
-
-class T2VEvalDataset(BaseDataset):
-    def __init__(
-        self,
-        metafile_or_dir_path,
-        sample_height=480,
-        sample_width=832,
-        sample_num_frames=49,
-        train_fps=16,
-        num_samples_per_prompt=1,
-        **kwargs,
-    ):
-        self.metafile_or_dir_path = metafile_or_dir_path
-        self._dataset_reader = None 
-        self.data_length = self._get_data_length()
-        self.num_samples_per_prompt = num_samples_per_prompt
-        self.data_length = self.data_length * self.num_samples_per_prompt
-        print(f'Build T2VEvalDataset, data length: {self.data_length}...')
-
-        self.sample_height = sample_height
-        self.sample_width = sample_width
-        self.sample_num_frames = sample_num_frames
-        self.train_fps = train_fps
-
-    def _get_data_length(self):
-        # 临时开一个 reader 获取长度后关掉
-        reader = LMDBReader(self.metafile_or_dir_path)
-        length = len(reader)
-        del reader
-        return length
-
-    @property
-    def dataset_reader(self):
-        # 每个 worker 进程第一次访问时才创建自己的 reader
-        # NOTE 重要：LMDB存在线程不安全的问题，一定要在worker内部初始化
-        if self._dataset_reader is None:
-            self._dataset_reader = LMDBReader(self.metafile_or_dir_path)
-        return self._dataset_reader
-
-    def __getitem__(self, index):
-        return self.getitem(index)
-
-    def __len__(self):
-        return self.data_length
-
-    def getitem(self, index):
-        video_index = index // self.num_samples_per_prompt
-        local_index = index % self.num_samples_per_prompt
-        examples = copy.deepcopy(T2VEvalOutputData)
-        meta_info = self.dataset_reader.getitem(video_index)
-        text = meta_info["cap"]
-        examples[PROMPT] = self.get_text_data(text)
-        examples[NAME_INDEX] = f"video_{video_index:06d}_{local_index:06d}"
-        return examples
-
-    def get_text_data(self, text):
-        if not isinstance(text, list):
-            text = [text]
-        text = random.choice(text)
-        return text
-
 dataset = {
     'wan_t2v': WanT2VDataset,
     't2v_random': T2VRandomDataset,
-    't2v_eval': T2VEvalDataset,
 }

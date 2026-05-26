@@ -271,7 +271,7 @@ class AbstractMetafileWriter(ABC):
 
 
 class LMDBWriter(AbstractMetafileWriter):
-    def __init__(self, map_size=1 << 40, compression=False, **kwargs):  # 默认 1 TB 空间
+    def __init__(self, map_size=1 << 40, compression=False, **kwargs):  # Default to 1 TB map size
         self.map_size = map_size
         self.compression = compression
 

@@ -11,7 +11,6 @@ class IndexFirstAxis(torch.autograd.Function):
         assert input.ndim >= 2
         other_shape = input.shape[1:]
         second_dim = other_shape.numel()
-        # torch.gather 比花式索引更快
         return torch.gather(
             rearrange(input, "b ... -> b (...)"), 0,
             repeat(indices, "z -> z d", d=second_dim)
@@ -33,7 +32,6 @@ class IndexFirstAxis(torch.autograd.Function):
             device=grad_output.device,
             dtype=grad_output.dtype,
         )
-        # torch.scatter_ 比 index_put_ accumulate 更快
         grad_input.scatter_(
             0, repeat(indices, "z -> z d", d=grad_output.shape[1]), grad_output
         )

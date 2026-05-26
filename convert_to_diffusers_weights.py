@@ -18,9 +18,6 @@ config = {
   'skiparse_model_type': "dual_end",
   'sparse_ratio': 2,
   'num_full_blocks': 8,
-  'num_register_tokens': 0,
-  'skiparse_1d': False,
-  'skiparse_2d': True,
 }
 
 state_dict = torch.load(orig_weights_path, map_location='cpu')

@@ -1,4 +1,4 @@
-from .datasets import ultra_datasets
-from .dataloader import ultra_samplers, ultra_collators
+from .datasets import ospnext_datasets
+from .dataloader import ospnext_samplers, ospnext_collators
 
-__all__ = ["ultra_datasets", "ultra_samplers", "ultra_collators"]
+__all__ = ["ospnext_datasets", "ospnext_samplers", "ospnext_collators"]

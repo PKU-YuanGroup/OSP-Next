@@ -3,15 +3,15 @@
 model_name: "osp_next"
 seed: 1024
 
-output_dir: "output/testtest"
+output_dir: "/path/to/output"
 
 training_iteration: 1000000
 # ddp_size: 1
 fsdp_size: 8
-cp_size: 4
-skiparse_cp_size: 2
-use_context_parallel: False
-use_skiparse_context_parallel: True
+sp_size: 4
+skiparse_sp_size: 2
+use_sequence_parallel: False
+use_skiparse_sequence_parallel: True
 reshard_after_forward: False
 explicit_prefetching_num_blocks: 2
 gradient_checkpointing: True
@@ -20,14 +20,14 @@ init_max_grad_norm: 1.0
 log_interval: 1
 save_interval: 1000
 weight_dtype: "bf16"
-ema_decay: 0.9993 # 0.9993对应的半衰期是1000
+ema_decay: 0.9993 # 0.9993 corresponds to a half-life of 1000 steps
 ema_update_interval: 1
 save_with_dcp_api: True
 profiling: False
 
 wandb_config:
   project_name: "osp_next"
-  exp_name: "osp_next_uni_1_3b_81f480p_sparse2d2_ssp2"
+  exp_name: "osp_next"
 
 model_config:
   dim: 1536
@@ -38,16 +38,10 @@ model_config:
   num_layers: 30
   out_dim: 16
   text_len: 512
-  skiparse_model_type: "uniform"
+  skiparse_model_type: "dual_end"
   sparse_ratio: 2
-  num_full_blocks: 10
-  num_register_tokens: 0
-  skiparse_1d: False
-  skiparse_2d: True
-  lock_main_parameters: False
-  training_with_full: False
-  pretrained_model_dir_or_checkpoint: "/home/ma-user/work/gyy/ospnext/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors"
-  pretrained_full_model_dir_or_checkpoint: "/home/ma-user/work/gyy/ospnext/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors"
+  num_full_blocks: 8
+  pretrained_model_dir_or_checkpoint: "/path/to/model"
 
 scheduler_config:
   scheduler_name: "flow_matching"
@@ -55,12 +49,12 @@ scheduler_config:
   use_logitnorm_time_sampling: True
 
 vae_config:
-  vae_path: "/home/ma-user/work/gyy/ospnext/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"
+  vae_path: "/path/to/vae"
   dtype: "fp16"
 
 text_encoder_config:
   text_len: 512
-  checkpoint_path: "/home/ma-user/work/gyy/ospnext/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth"
+  checkpoint_path: "/path/to/text_encoder"
   use_fsdp: True
 
 data_config:
@@ -71,8 +65,8 @@ data_config:
   shuffle: True
   dataset_name: "wan_t2v"
   dataset_config:
-    metafile_or_dir_path: "/home/ma-user/work/data/osp-yuan/hq_videos_81f720p/filtered_samples_2572816.lmdb"
-    text_tokenizer_path: "/home/ma-user/work/gyy/ospnext/Wan2.1-T2V-1.3B/google/umt5-xxl"
+    metafile_or_dir_path: "/path/to/train/dataset"
+    text_tokenizer_path: "/path/to/text_tokenizer"
     text_drop_ratio: 0.1
     sample_height: 480
     sample_width: 832

@@ -1,7 +1,4 @@
-# export WANDB_MODE="online"
-# export WANDB_API_KEY="720d886d8c437c2142c88056a1eab8ef78d64a1f"
-# wandb login $WANDB_API_KEY
-# export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
+export WANDB_MODE="offline"
 
 export TOKENIZERS_PARALLELISM=false
 
@@ -31,5 +28,5 @@ torchrun \
   --nnodes=${NNODES} \
   --master_addr=${MASTER_ADDR} \
   --master_port=${MASTER_PORT} \
-  train/train.py \
-  --config configs/train/npu/t2v_1_3b.yaml
+  train/train_osp.py \
+  --config configs/train/npu/osp_14b.yaml
