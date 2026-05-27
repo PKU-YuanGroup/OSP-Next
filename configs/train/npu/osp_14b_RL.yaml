@@ -90,10 +90,17 @@ rl_config:
   num_frames: 81
   sde_steps: 10
   num_inference_steps: 25
+  guidance_scale: 5.0
   kl_beta: 0.004
   num_batches_per_epoch: 4
   num_image_per_prompt: 4
+  sample_time_per_prompt: 1
   sample_batch_size: 2
   train_batch_size: 2
+  eval_num_steps: 50
+  eval_freq: 20
+  use_cfg_in_train: True
+  adv_clip_max: 5.0
+  clip_range: 1e-4
   reward_fn:
     videoalign: 1.0

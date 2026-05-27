@@ -1,23 +1,7 @@
-"""
-OSPNext RL Post-Training Script (GRPO) with LoRA + FSDP2
-
-Based on train_osp_RL.py's FSDP2 distributed infrastructure, but uses LoRA
-for parameter-efficient training.
-
-Key design:
-  - FSDP2 for distributed training (same as train_osp_RL.py / train.py)
-  - peft LoRA for parameter-efficient fine-tuning
-  - ref_model via disable_adapter() instead of separate model copy
-  - FSDPEMAModel for EMA (same as train_osp_RL.py)
-  - Checkpointer for checkpoint management (same as train_osp_RL.py)
-  - AdaptiveGradClipper for gradient clipping (same as train_osp_RL.py)
-"""
-
 import os
 import sys
 import math
 import yaml
-import time
 import json
 import random
 import tempfile
@@ -30,7 +14,7 @@ from argparse import ArgumentParser
 import wandb
 import imageio
 
-from ospnext.utils.utils import check_and_import_npu, is_npu_available
+from torchdiff.utils.utils import check_and_import_npu
 import torch
 check_and_import_npu()
 
@@ -41,20 +25,18 @@ from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
-from ospnext.utils.log_utils import get_logger, log_on_main_process, verify_min_gpu_count
-from ospnext.utils.random_utils import set_seed
-from ospnext.distributed.utils import (
+from torchdiff.utils.log_utils import get_logger, log_on_main_process, verify_min_gpu_count
+from torchdiff.utils.random_utils import set_seed
+from torchdiff.distributed.utils import (
     setup_distributed_env,
     cleanup_distributed_env,
-    set_modules_to_forward_prefetch,
-    set_modules_to_backward_prefetch,
     gather_data_from_all_ranks,
 )
-from ospnext.distributed.fsdp2_wrapper import FSDP2_mix_wrapper
-from ospnext.distributed.fsdp_ema import FSDPEMAModel as EMAModel
-from ospnext.distributed.sp_state import sp_state
+from torchdiff.distributed.fsdp2_wrapper import FSDP2_mix_wrapper
+from torchdiff.distributed.fsdp_ema import FSDPEMAModel as EMAModel
+from torchdiff.distributed.cp_state import cp_state
 
-from ospnext.modules import (
+from torchdiff.modules import (
     WanVAE,
     T5EncoderModel,
     models,
@@ -62,33 +44,23 @@ from ospnext.modules import (
     models_blocks_to_float,
     models_blocks_to_output_float,
 )
-from ospnext.schedulers import schedulers
+from torchdiff.schedulers import schedulers
 
-from ospnext.distributed.checkpoint import Checkpointer, PREFIX as checkpoint_prefix
-from ospnext.utils.constant import PROMPT, PROMPT_IDS, PROMPT_MASK
-from ospnext.utils.utils import str_to_precision, params_nums_to_str, get_memory_allocated
-from ospnext.utils.clip_grads import AdaptiveGradClipper
-from ospnext.data.utils.wan_utils import WanTextProcessor
+from torchdiff.distributed.checkpoint import Checkpointer, PREFIX as checkpoint_prefix
+from torchdiff.utils.constant import PROMPT, PROMPT_IDS, PROMPT_MASK
+from torchdiff.utils.utils import str_to_precision, params_nums_to_str, get_memory_allocated
+from torchdiff.utils.clip_grads import AdaptiveGradClipper
+from torchdiff.data.utils.wan_utils import WanTextProcessor
 from transformers import AutoTokenizer
 
 from peft import LoraConfig, get_peft_model, PeftModel
 
 
 def get_ddp_rank_and_fsdp_local_rank(rank, fsdp_size, world_size):
-    """
-    Assuming mesh shape is (ddp_size, fsdp_size) and global ranks are laid out contiguously:
-        global_rank = ddp_rank * fsdp_size + fsdp_local_rank
-
-    Returns:
-        ddp_rank: index of data-parallel replica
-        fsdp_local_rank: local rank inside one FSDP replica
-    """
     ddp_size = max(1, world_size // fsdp_size)
     ddp_rank = rank // fsdp_size
     fsdp_local_rank = rank % fsdp_size
     return ddp_rank, fsdp_local_rank, ddp_size
-
-# ==================== RL Utilities ====================
 
 def sde_step_with_logprob(
     sigmas_schedule,
@@ -98,14 +70,10 @@ def sde_step_with_logprob(
     num_inference_steps,
     prev_sample=None,
     generator=None,
-    determistic=False,
+    deterministic=False,
     return_dt_and_std_dev_t=False,
-    sp_group=None,
+    cp_group=None,
 ):
-    """
-    Flow matching SDE step with log probability computation.
-    Adapted from train_osp_RL.py.
-    """
     model_output = model_output.float()
     sample = sample.float()
     if prev_sample is not None:
@@ -118,7 +86,6 @@ def sde_step_with_logprob(
 
     dt = sigma_prev - sigma
 
-    # Reshape for broadcasting: [B, 1, 1, 1, 1] for 5D latents
     sigma_b = sigma.view(1, 1, 1, 1, 1) if sigma.dim() == 0 else sigma.view(-1, 1, 1, 1, 1)
     dt_b = dt.view(1, 1, 1, 1, 1) if dt.dim() == 0 else dt.view(-1, 1, 1, 1, 1)
 
@@ -139,16 +106,15 @@ def sde_step_with_logprob(
                 device=model_output.device,
                 dtype=model_output.dtype,
             )
-            if sp_group is not None:
-                torch.distributed.broadcast(variance_noise, src=dist.get_global_rank(sp_group, 0), group=sp_group)
+            if cp_group is not None:
+                torch.distributed.broadcast(variance_noise, src=dist.get_global_rank(cp_group, 0), group=cp_group)
             prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1 * dt_b) * variance_noise
         else:
             prev_sample = prev_sample_mean
 
-    if determistic:
+    if deterministic:
         prev_sample = sample + dt_b * model_output
 
-    # Compute log probability
     log_prob = (
         -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * ((std_dev_t * torch.sqrt(-1 * dt_b)) ** 2))
         - torch.log(std_dev_t * torch.sqrt(-1 * dt_b))
@@ -174,41 +140,21 @@ def osp_sample_with_logprob(
     guidance_scale=5.0,
     negative_text_embeddings=None,
     start_frame_latents=None,
-    determistic=False,
+    deterministic=False,
     kl_reward=0.0,
-    sp_group=None,
+    cp_group=None,
     sde_steps=None,
 ):
-    """
-    Sample from OSPNext model with log probability tracking.
-    For LoRA: uses disable_adapter() for ref model KL computation.
-
-    SDE/ODE hybrid denoising:
-        - the first sde_steps steps (step 0 ~ sde_steps-1) use SDE (add random noise) to denoise, and record log_prob
-        - the remaining steps (step sde_steps ~ num_inference_steps-1) use ODE (deterministic) to denoise, and set log_prob to 0
-
-    Args:
-        sde_steps: int, the number of steps to use SDE to denoise. Default None means all steps use SDE.
-                   Only the latents and log_probs from the SDE steps are used in downstream training.
-
-    Returns:
-        videos: decoded video tensor [B, C, T, H, W] in float, range [-1, 1]
-        all_latents: list of latent tensors at each step (only SDE steps, on CPU)
-        all_log_probs: list of log_prob tensors at each step (only SDE steps, on CPU)
-        all_kl: list of KL divergence tensors at each step (only SDE steps, on CPU)
-    """
     if sde_steps is None:
         sde_steps = num_inference_steps
     B, C, T, H, W = latent_shape
     do_cfg = guidance_scale > 1.0
 
-    # Generate initial noise
     latents = torch.randn(latent_shape, device=device, dtype=torch.float32)
 
-    if sp_group is not None:
-        torch.distributed.broadcast(latents, src=dist.get_global_rank(sp_group, 0), group=sp_group)
+    if cp_group is not None:
+        torch.distributed.broadcast(latents, src=dist.get_global_rank(cp_group, 0), group=cp_group)
 
-    # Set up sigma schedule
     sigmas = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
     if hasattr(scheduler, 'shift') and scheduler.shift != 1.0:
         shift = scheduler.shift
@@ -216,14 +162,13 @@ def osp_sample_with_logprob(
 
     timesteps = sigmas * 1000.0
 
-    all_latents = [latents]  # only record SDE steps' latents (for training)
+    all_latents = [latents]  # 仅记录 SDE 步的 latent（用于训练）
     all_log_probs = []
     all_kl = []
 
     for i in range(num_inference_steps):
         torch.cuda.synchronize()
 
-        # check if current step is SDE or ODE
         is_sde_step = (i < sde_steps)
 
         latents_input = latents.to(weight_dtype)
@@ -254,36 +199,32 @@ def osp_sample_with_logprob(
         latents_ori = latents.clone()
 
         if is_sde_step:
-            # SDE step: add random noise, record log_prob
             latents, log_prob, prev_latents_mean, std_dev_t = sde_step_with_logprob(
                 sigmas,
                 noise_pred.float(),
                 i,
                 latents.float(),
                 num_inference_steps,
-                determistic=False,
-                sp_group=sp_group,
+                deterministic=False,
+                cp_group=cp_group,
             )
         else:
-            # ODE step: deterministic denoising, no noise added
             latents, log_prob, prev_latents_mean, std_dev_t = sde_step_with_logprob(
                 sigmas,
                 noise_pred.float(),
                 i,
                 latents.float(),
                 num_inference_steps,
-                determistic=True,
-                sp_group=sp_group,
+                deterministic=True,
+                cp_group=cp_group,
             )
         del noise_pred, latents_input
 
-        # only save SDE steps' latent/log_prob/kl, ODE steps do not participate in training
         if is_sde_step:
             all_latents.append(latents)
             all_log_probs.append(log_prob)
 
-        # KL computation against reference model (LoRA: disable adapter) — only SDE steps
-        if is_sde_step and kl_reward > 0 and not determistic:
+        if is_sde_step and kl_reward > 0 and not deterministic:
             with model.disable_adapter():
                 with torch.autocast("cuda", dtype=weight_dtype):
                     ref_noise_pred = model(
@@ -312,7 +253,7 @@ def osp_sample_with_logprob(
                 latents_ori.float(),
                 num_inference_steps,
                 prev_sample=latents.float(),
-                sp_group=sp_group,
+                cp_group=cp_group,
             )
             del ref_noise_pred
             kl = ((prev_latents_mean - ref_prev_latents_mean) ** 2 / (2 * std_dev_t ** 2))
@@ -323,12 +264,10 @@ def osp_sample_with_logprob(
             all_kl.append(torch.zeros(B, device=device))
         del latents_ori, prev_latents_mean, std_dev_t
 
-        # periodically clear memory
         if (i + 1) % 5 == 0:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-    # before VAE decode, transfer all_latents/log_probs/kl to CPU, release memory for VAE decode
     all_latents_cpu = [l.cpu() for l in all_latents]
     all_log_probs_cpu = [lp.cpu() for lp in all_log_probs]
     all_kl_cpu = [k.cpu() for k in all_kl]
@@ -337,7 +276,6 @@ def osp_sample_with_logprob(
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    # Decode latents to video
     with torch.no_grad():
         videos = vae.decode(latents)  # [B, C, T, H, W], range [-1, 1]
     del latents
@@ -358,28 +296,12 @@ def osp_sample_deterministic(
     guidance_scale=5.0,
     negative_text_embeddings=None,
     start_frame_latents=None,
-    sp_group=None,
 ):
-    """
-    Deterministic ODE sampling for evaluation (no log_prob tracking).
-
-    Uses full ODE steps (no SDE noise) for reproducible eval generation.
-    Returns only decoded video tensor.
-
-    When sequence parallelism is enabled, the initial noise is broadcast
-    across ``sp_group`` so that all ranks within the same SP group share
-    the same starting latents (required for sharded sequence computation).
-    """
     B, C, T, H, W = latent_shape
     do_cfg = guidance_scale > 1.0
 
-    # Generate initial noise
     latents = torch.randn(latent_shape, device=device, dtype=torch.float32)
 
-    if sp_group is not None:
-        torch.distributed.broadcast(latents, src=dist.get_global_rank(sp_group, 0), group=sp_group)
-
-    # Set up sigma schedule
     sigmas = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
     if hasattr(scheduler, 'shift') and scheduler.shift != 1.0:
         shift = scheduler.shift
@@ -415,15 +337,14 @@ def osp_sample_deterministic(
             noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
             del noise_uncond
 
-        # ODE step (deterministic)
         latents, _, _, _ = sde_step_with_logprob(
             sigmas,
             noise_pred.float(),
             i,
             latents.float(),
             num_inference_steps,
-            determistic=True,
-            sp_group=None,
+            deterministic=True,
+            cp_group=None,
         )
         del noise_pred, latents_input
 
@@ -435,7 +356,6 @@ def osp_sample_deterministic(
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    # Decode latents to video
     videos = vae.decode(latents)  # [B, C, T, H, W], range [-1, 1]
     del latents
 
@@ -453,10 +373,8 @@ def compute_log_prob_for_training(
     guidance_scale=1.0,
     negative_text_embeddings=None,
     start_frame_latents=None,
+    cp_group=None,
 ):
-    """
-    Compute log probability for a single denoising step during training.
-    """
     do_cfg = guidance_scale > 1.0
     latents_input = sample["latents"][:, step_idx].to(weight_dtype)
     t = (sigmas_schedule[step_idx] * 1000.0).expand(latents_input.shape[0]).to(latents_input.device)
@@ -467,18 +385,9 @@ def compute_log_prob_for_training(
         text_embeddings,
         start_frame_latents=start_frame_latents,
     )
-    
-    # --- DEBUG: check the type and gradient state of model forward output ---
-    if torch.distributed.get_rank() == 0 and step_idx == 0:
-        print(f"[DEBUG fwd] noise_pred type={type(noise_pred).__name__}, "
-              f"requires_grad={noise_pred.requires_grad}, "
-              f"is_DTensor={isinstance(noise_pred, DTensor)}")
-    # --- END DEBUG ---
+
 
     if do_cfg and negative_text_embeddings is not None:
-        # uncond forward does not need gradient (CFG only uses it for direction guidance),
-        # use no_grad to avoid the problem that DTensor weights do not match with normal Tensor inputs when gradient checkpoint recompute.
-        # (i.e. the mismatch between DTensor weights and regular Tensor inputs.)
         with torch.no_grad():
             noise_uncond = model(
                 latents_input,
@@ -486,21 +395,11 @@ def compute_log_prob_for_training(
                 negative_text_embeddings,
                 start_frame_latents=start_frame_latents,
             )
-        # first detach uncond to ensure no irrelevant gradient graph is introduced,
-        # then use torch.lerp to avoid the compatibility problem of Python float * DTensor
         noise_uncond = noise_uncond.detach()
         noise_pred = torch.lerp(noise_uncond, noise_pred, guidance_scale)
 
-    # ensure noise_pred is a normal Tensor (not DTensor), because sde_step_with_logprob
-    # does not support DTensor in scalar operations.
-    # note: DTensor.full_tensor() may not support autograd backward in some environments (such as NPU),
-    # causing the gradient to not be backpropagated to LoRA parameters. Use redistribute + _local_tensor to preserve the gradient graph.
-    # if isinstance(noise_pred, DTensor):
-    #     from torch.distributed.tensor.placement_types import Replicate
-    #     noise_pred = noise_pred.redistribute(placements=[Replicate()])._local_tensor
-
     if isinstance(noise_pred, DTensor):
-        noise_pred = noise_pred.full_tensor()  # preserve the full autograd chain
+        noise_pred = noise_pred.full_tensor()  # 保留完整的 autograd 链路
 
     prev_sample, log_prob, prev_sample_mean, std_dev_t, dt = sde_step_with_logprob(
         sigmas_schedule,
@@ -510,23 +409,13 @@ def compute_log_prob_for_training(
         num_inference_steps,
         prev_sample=sample["next_latents"][:, step_idx].float(),
         return_dt_and_std_dev_t=True,
-        sp_group=None,
+        cp_group=cp_group,
     )
-
-    # --- DEBUG: check the gradient chain of log_prob ---
-    if torch.distributed.get_rank() == 0 and step_idx == 0:
-        _diff = (sample["next_latents"][:, step_idx].float().detach() - prev_sample_mean.detach())
-        print(f"[DEBUG chain] noise_pred.requires_grad={noise_pred.requires_grad}, "
-              f"log_prob.requires_grad={log_prob.requires_grad}, "
-              f"log_prob.grad_fn={log_prob.grad_fn}, "
-              f"|prev_sample - prev_sample_mean|={_diff.abs().mean().item():.8f}")
-    # --- END DEBUG ---
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t, dt
 
 
 class TextPromptDataset(Dataset):
-    """Text prompt dataset that tokenizes prompts like t2v_dataset.py."""
     def __init__(self, file_path, text_tokenizer_path, text_max_length=512, return_prompt_mask=True):
         with open(file_path, 'r') as f:
             self.prompts = [line.strip() for line in f.readlines() if line.strip()]
@@ -564,9 +453,6 @@ class TextPromptDataset(Dataset):
 
 
 class DistributedKRepeatSampler(Sampler):
-    """
-    Distributed sampler that repeats each sample k times across all ranks.
-    """
     def __init__(self, dataset, batch_size, k, num_replicas, rank, seed=0):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -600,7 +486,6 @@ class DistributedKRepeatSampler(Sampler):
 
 
 class PerPromptStatTracker:
-    """Track per-prompt statistics for advantage normalization."""
     def __init__(self, global_std=False):
         self.global_std = global_std
         self.stats = {}
@@ -637,7 +522,6 @@ class PerPromptStatTracker:
 
 
 def calculate_zero_std_ratio(prompts, gathered_rewards):
-    """Calculate the ratio of prompts with zero reward std."""
     prompt_array = np.array(prompts)
     unique_prompts, inverse_indices, counts = np.unique(
         prompt_array, return_inverse=True, return_counts=True
@@ -651,50 +535,31 @@ def calculate_zero_std_ratio(prompts, gathered_rewards):
 
 
 def save_lora_checkpoint(model, save_dir, global_step):
-    """Save LoRA weights only (for LoRA-specific checkpoint, rank 0 only).
-    
-    NOTE: We manually extract and clone LoRA parameters instead of using
-    model.save_pretrained(), because after FSDP's _get_full_model_state_dict()
-    the underlying tensor storage may become invalid, causing
-    'RuntimeError: Attempted to access the data pointer on an invalid python storage.'
-    """
-    from torch.distributed.tensor import DTensor
-    
     save_root = os.path.join(save_dir, f"lora-checkpoint-{global_step}")
     if dist.get_rank() == 0:
         os.makedirs(save_root, exist_ok=True)
     dist.barrier()
-    
-    # Manually extract LoRA parameters (keys containing 'lora_')
+
     lora_state_dict = {}
     for name, param in model.named_parameters():
         if 'lora_' in name:
-            # Handle FSDP DTensor: full_tensor() requires all ranks to participate
             if isinstance(param, DTensor):
                 full_param = param.full_tensor()
             else:
                 full_param = param
                 
             if dist.get_rank() == 0:
-                # Clone and move to CPU to avoid invalid storage issues
                 lora_state_dict[name] = full_param.detach().clone().cpu()
     
     if dist.get_rank() == 0 and lora_state_dict:
         torch.save(lora_state_dict, os.path.join(save_root, "adapter_model.bin"))
-        
-        # --- DEBUG: print LoRA param norms to verify they changed ---
-        for _name, _val in list(lora_state_dict.items())[:3]:
-            print(f"[DEBUG save_lora] {_name}: norm={_val.norm().item():.8f}, mean={_val.mean().item():.10f}")
-        # --- END DEBUG ---
-        
-        # Also save the adapter config if available
+
         if hasattr(model, 'peft_config'):
-            import json
             for adapter_name, peft_cfg in model.peft_config.items():
                 config_dict = peft_cfg.to_dict() if hasattr(peft_cfg, 'to_dict') else vars(peft_cfg)
                 with open(os.path.join(save_root, "adapter_config.json"), "w") as f:
                     json.dump(config_dict, f, indent=2, default=str)
-                break  # Save config for the first (default) adapter
+                break
         
         print(f"[Rank 0] LoRA checkpoint saved to {save_root} ({len(lora_state_dict)} parameters)")
 
@@ -743,15 +608,14 @@ def main(config):
 
     # model config
     model_name = config.get("model_name", "osp_next")
-    task = config.get("task", "t2v")
     model_config = config.get("model_config", {})
     vae_config = config.get("vae_config", {})
     text_encoder_config = config.get("text_encoder_config", {})
     scheduler_config = config.get("scheduler_config", {})
-    # skiparse related
+    # skiparse 相关
     sparse_ratio = model_config.get("sparse_ratio", 1)
-    skiparse_model_type = model_config.get("skiparse_model_type", "full")
-    is_skiparse_model = skiparse_model_type != "full"
+    skiparse_1d = model_config.get("skiparse_1d", False)
+    skiparse_2d = model_config.get("skiparse_2d", False)
     num_full_blocks = model_config.get("num_full_blocks", 0)
 
     # LoRA config
@@ -775,7 +639,7 @@ def main(config):
     num_image_per_prompt = rl_config.get("num_image_per_prompt", 4)
     sample_time_per_prompt = rl_config.get("sample_time_per_prompt", 1)
     timestep_fraction = rl_config.get("timestep_fraction", 1.0)
-    clip_range = rl_config.get("clip_range", 5e-3)
+    clip_range = rl_config.get("clip_range", 1e-4)
     adv_clip_max = rl_config.get("adv_clip_max", 5.0)
     kl_reward = rl_config.get("kl_reward", 0.0)
     kl_beta = rl_config.get("kl_beta", 0.0)
@@ -790,8 +654,8 @@ def main(config):
     video_num_frames = rl_config.get("num_frames", 81)
     eval_freq = rl_config.get("eval_freq", 10000)
     eval_num_steps = rl_config.get("eval_num_steps", 50)
-    # SDE/ODE hybrid: the first sde_steps steps use SDE (with noise), the remaining steps use ODE (deterministic)
-    sde_steps = rl_config.get("sde_steps", num_inference_steps)  # default is all steps use SDE
+    # SDE/ODE hybrid: 前 sde_steps 步使用 SDE（有噪声），剩余步使用 ODE（确定性）
+    sde_steps = rl_config.get("sde_steps", num_inference_steps)  # 默认全 SDE
 
     # EMA config
     ema_decay = config.get("ema_decay", 0.9999)
@@ -808,7 +672,6 @@ def main(config):
     gradient_checkpointing = config.get("gradient_checkpointing", False)
     gradient_accumulation_steps = config.get("gradient_accumulation_steps", 1)
     init_max_grad_norm = config.get("init_max_grad_norm", 1.0)
-    log_interval = config.get("log_interval", 1)
     save_interval = config.get("save_interval", 100)
     weight_dtype = config.get("weight_dtype", "bfloat16")
     resume_epoch = config.get("resume_epoch", None)
@@ -817,15 +680,14 @@ def main(config):
     reshard_after_forward = config.get("reshard_after_forward", None)
     model_cpu_offload = config.get("model_cpu_offload", False)
     encoder_cpu_offload = config.get("encoder_cpu_offload", False)
-    use_sequence_parallel = config.get("use_sequence_parallel", False)
-    use_skiparse_sequence_parallel = config.get("use_skiparse_sequence_parallel", False)
+    use_context_parallel = config.get("use_context_parallel", False)
+    use_skiparse_context_parallel = config.get("use_skiparse_context_parallel", False)
     deterministic_training = config.get("deterministic_training", False)
 
     # save config
     output_dir = config.get("output_dir", "./output_rl_lora")
     save_with_dcp_api = config.get("save_with_dcp_api", False)
 
-    # ========== Distributed Setup ==========
     setup_distributed_env()
     verify_min_gpu_count()
 
@@ -835,7 +697,6 @@ def main(config):
     device = torch.device(f"cuda:{local_rank}")
     weight_dtype = str_to_precision(weight_dtype)
 
-    # wandb
     wandb_config = config.get("wandb_config", {})
     if wandb_config.get("project_name", None) is not None and rank == 0:
         project_name = wandb_config.get("project_name")
@@ -846,7 +707,6 @@ def main(config):
             dir=output_dir,
         )
 
-    # ===== FSDP mesh (same as train.py / train_osp_RL.py) =====
     fsdp_size = config.get("fsdp_size", 8)
     if fsdp_size > world_size:
         fsdp_size = world_size
@@ -857,41 +717,40 @@ def main(config):
     ddp_fsdp_mesh = init_device_mesh("cuda", (ddp_size, fsdp_size), mesh_dim_names=("ddp", "fsdp"))
     logger.info(f"rank {rank} use ddp mesh {ddp_fsdp_mesh['ddp']} and fsdp mesh {ddp_fsdp_mesh['fsdp']}")
 
-    # ===== Sequence Parallelism (SP) init =====
     dp_group = dist.group.WORLD
-    sp_size = 1
-    use_sequence_parallel = use_sequence_parallel and config.get("sp_size", 1) > 1
-    skiparse_sp_size = 1
-    use_skiparse_sequence_parallel = use_skiparse_sequence_parallel and config.get("skiparse_sp_size", 1) > 1 and sparse_ratio > 1
-    use_global_sequence_parallel = use_sequence_parallel or use_skiparse_sequence_parallel
-    global_sp_size = 1
-    full_sp_size = 1
-    use_full_blocks_sequence_parallel = use_global_sequence_parallel and is_skiparse_model and num_full_blocks > 0
-    global_sp_group = None
+    cp_size = 1
+    use_context_parallel = use_context_parallel and config.get("cp_size", 1) > 1
+    skiparse_cp_size = 1
+    use_skiparse_context_parallel = use_skiparse_context_parallel and config.get("skiparse_cp_size", 1) > 1 and sparse_ratio > 1
+    use_global_context_parallel = use_context_parallel or use_skiparse_context_parallel
+    global_cp_size = 1
+    full_cp_size = 1
+    use_full_blocks_context_parallel = use_global_context_parallel and (skiparse_1d or skiparse_2d) and num_full_blocks > 0
+    global_cp_group = None
 
-    if use_global_sequence_parallel:
-        if use_sequence_parallel:
-            sp_size = config.get("sp_size", 1)
-        if use_skiparse_sequence_parallel:
-            skiparse_sp_size = config.get("skiparse_sp_size", 1)
-            if is_skiparse_model:
-                # OSP-Next skiparse is 2D, so the per-rank shard must evenly divide sparse_ratio ** 2.
-                assert skiparse_sp_size <= sparse_ratio ** 2 and (sparse_ratio ** 2) % skiparse_sp_size == 0
-        global_sp_size = skiparse_sp_size * sp_size
-        dp_global_sp_mesh = init_device_mesh("cuda", (world_size // global_sp_size, skiparse_sp_size, sp_size), mesh_dim_names=("dp", "skiparse_sp", "sp"))
-        dp_group = dp_global_sp_mesh["dp"].get_group()
-        global_sp_group = dp_global_sp_mesh["skiparse_sp", "sp"]._flatten().get_group()
-        skiparse_sp_group = dp_global_sp_mesh["skiparse_sp"].get_group()
-        full_sp_group = sp_group = dp_global_sp_mesh["sp"].get_group()
-        log_on_main_process(logger, f"Using sequence parallel: global_sp_size={global_sp_size}, sp_size={sp_size}, skiparse_sp_size={skiparse_sp_size}")
-        sp_state.reset(global_sp_group=global_sp_group, sp_group=sp_group, skiparse_sp_group=skiparse_sp_group, full_sp_group=full_sp_group)
+    if use_global_context_parallel:
+        if use_context_parallel:
+            cp_size = config.get("cp_size", 1)
+        if use_skiparse_context_parallel:
+            skiparse_cp_size = config.get("skiparse_cp_size", 1)
+            if skiparse_1d:
+                assert skiparse_cp_size <= sparse_ratio and sparse_ratio % skiparse_cp_size == 0
+            elif skiparse_2d:
+                assert skiparse_cp_size <= sparse_ratio ** 2 and (sparse_ratio ** 2) % skiparse_cp_size == 0
+        global_cp_size = skiparse_cp_size * cp_size
+        dp_global_cp_mesh = init_device_mesh("cuda", (world_size // global_cp_size, skiparse_cp_size, cp_size), mesh_dim_names=("dp", "skiparse_cp", "cp"))
+        dp_group = dp_global_cp_mesh["dp"].get_group()
+        global_cp_group = dp_global_cp_mesh["skiparse_cp", "cp"]._flatten().get_group()
+        skiparse_cp_group = dp_global_cp_mesh["skiparse_cp"].get_group()
+        full_cp_group = cp_group = dp_global_cp_mesh["cp"].get_group()
+        log_on_main_process(logger, f"Using context parallel: global_cp_size={global_cp_size}, cp_size={cp_size}, skiparse_cp_size={skiparse_cp_size}")
+        cp_state.reset(global_cp_group=global_cp_group, cp_group=cp_group, skiparse_cp_group=skiparse_cp_group, full_cp_group=full_cp_group)
 
     if rank == 0:
         os.makedirs(output_dir, exist_ok=True)
 
     set_seed(seed, device_specific=False)
 
-    # ========== Init Models ==========
     log_on_main_process(logger, "Initializing VAE model...")
     vae = WanVAE(
         vae_pth=vae_config.get("vae_path", None),
@@ -928,19 +787,15 @@ def main(config):
     log_on_main_process(logger, "Initializing scheduler...")
     scheduler = schedulers[scheduler_config.get("scheduler_name", "flow_matching")](**scheduler_config)
 
-    # ========== Init Diffusion Model + LoRA + FSDP2 ==========
     log_on_main_process(logger, "Initializing diffusion model...")
     pretrained_model_dir_or_checkpoint = model_config.get("pretrained_model_dir_or_checkpoint", None)
     has_loaded_pretrained_model = False
 
-    # Step 1: Load pretrained base model
     if pretrained_model_dir_or_checkpoint is not None and os.path.isdir(pretrained_model_dir_or_checkpoint):
         log_on_main_process(logger, f"Load model from pretrained_model_dir {pretrained_model_dir_or_checkpoint}")
         model = models[model_name].from_pretrained(pretrained_model_dir_or_checkpoint)
         has_loaded_pretrained_model = True
     elif pretrained_model_dir_or_checkpoint is not None and os.path.isfile(pretrained_model_dir_or_checkpoint):
-        # Base model checkpoint file: load weights BEFORE LoRA/FSDP2 wrapping
-        # so that key names match the original model structure
         log_on_main_process(logger, f"Load base model from checkpoint file {pretrained_model_dir_or_checkpoint}")
         model = models[model_name](**model_config)
         if pretrained_model_dir_or_checkpoint.endswith(".safetensors"):
@@ -961,27 +816,19 @@ def main(config):
         with torch.device("meta"):
             model = models[model_name](**model_config)
 
-    # SP head count validation and full_blocks_sp_group setup (from train_osp.py)
-    if use_sequence_parallel or use_full_blocks_sequence_parallel:
-        if use_sequence_parallel and model.num_heads % sp_size != 0:
-            raise ValueError(f"When using sequence parallel, num_heads {model.num_heads} must be multiple of sp_size {sp_size}!")
-        if use_full_blocks_sequence_parallel:
-            if global_sp_size <= model.num_heads and model.num_heads % global_sp_size == 0:
-                full_sp_size = global_sp_size
+    if use_context_parallel or use_full_blocks_context_parallel:
+        if use_context_parallel and model.num_heads % cp_size != 0:
+            raise ValueError(f"When using context parallel, num_heads {model.num_heads} must be multiple of cp_size {cp_size}!")
+        if use_full_blocks_context_parallel:
+            if global_cp_size <= model.num_heads and model.num_heads % global_cp_size == 0:
+                full_cp_size = global_cp_size
             else:
-                gcd = math.gcd(model.num_heads, global_sp_size)
-                full_sp_size = gcd
-            dummy_mesh = init_device_mesh("cuda", (world_size // full_sp_size, full_sp_size), mesh_dim_names=("dummy", "full_sp"))
-            full_sp_group = dummy_mesh["full_sp"].get_group()
-            sp_state.reset(full_sp_group=full_sp_group)
+                gcd = math.gcd(model.num_heads, global_cp_size)
+                full_cp_size = gcd
+            dummy_mesh = init_device_mesh("cuda", (world_size // full_cp_size, full_cp_size), mesh_dim_names=("dummy", "full_cp"))
+            full_cp_group = dummy_mesh["full_cp"].get_group()
+            cp_state.reset(full_cp_group=full_cp_group)
 
-    # Step 2: Apply LoRA (before FSDP2 wrapping)
-    # NOTE: Do NOT freeze base model before FSDP2 wrap!
-    # FSDP2's fully_shard packs module parameters into FlatParameters.
-    # If base params have requires_grad=False before wrapping, the FlatParameter
-    # will also be requires_grad=False, breaking gradient tracking through LoRA layers.
-    # Instead, we keep all params requires_grad=True for FSDP2, and only pass
-    # LoRA params to the optimizer (Step 8) so only LoRA gets updated.
     if lora_path:
         log_on_main_process(logger, f"Loading existing LoRA from {lora_path}")
         model = PeftModel.from_pretrained(model, lora_path)
@@ -1000,15 +847,8 @@ def main(config):
     if rank == 0:
         model.print_trainable_parameters()
 
-    # CRITICAL: After PEFT's get_peft_model / PeftModel.from_pretrained, base params
-    # are requires_grad=False. We must re-enable requires_grad for ALL params before
-    # FSDP2 wrapping, because FSDP2's fully_shard creates FlatParameters that inherit
-    # requires_grad from the original params. If base params are frozen, the FlatParameter
-    # (which contains both base + LoRA params in the same module) may lose gradient
-    # tracking, causing loss.backward() to fail with "does not require grad".
-    # Only LoRA params will be passed to the optimizer (Step 8) so base weights
-    # still won't be updated.
-    model.requires_grad_(True)
+    for name, param in model.named_parameters():
+        param.requires_grad = 'lora_' in name
 
     base_model = model.get_base_model() if hasattr(model, 'get_base_model') else model
     model.train()
@@ -1018,11 +858,7 @@ def main(config):
         model.to("cpu")
         torch.cuda.empty_cache()
 
-    # Step 3: FSDP2 wrap (wraps the entire PeftModel including LoRA params)
-    # All params are requires_grad=True at this point so FSDP2 FlatParameters
-    # maintain gradient tracking through the forward pass.
     log_on_main_process(logger, "Starting FSDP2 wrapping...")
-    import sys; sys.stdout.flush(); sys.stderr.flush()
     FSDP2_mix_wrapper(
         model,
         dp_mesh=ddp_fsdp_mesh,
@@ -1034,7 +870,6 @@ def main(config):
         cpu_offload=model_cpu_offload,
     )
     log_on_main_process(logger, "FSDP2 wrapping completed successfully.")
-    sys.stdout.flush(); sys.stderr.flush()
 
     if not has_loaded_pretrained_model:
         init_device = "cpu" if model_cpu_offload else device
@@ -1043,9 +878,7 @@ def main(config):
         base_model.reset_parameters()
 
     log_on_main_process(logger, f"Diffusion model (LoRA + FSDP2) initialized, memory: {get_memory_allocated()} GiB")
-    sys.stdout.flush(); sys.stderr.flush()
 
-    # Step 5: Gradient checkpointing
     if gradient_checkpointing:
         log_on_main_process(logger, "Using gradient checkpointing")
         if hasattr(base_model, 'set_gradient_checkpointing'):
@@ -1053,7 +886,6 @@ def main(config):
         elif hasattr(model, 'enable_gradient_checkpointing'):
             model.enable_gradient_checkpointing()
 
-    # Step 5.5: Validate disable_adapter() works with FSDP2
     if (kl_reward > 0 or kl_beta > 0) and hasattr(model, 'disable_adapter'):
         try:
             with model.disable_adapter():
@@ -1062,11 +894,9 @@ def main(config):
             log_on_main_process(logger, f"WARNING: disable_adapter() failed under FSDP2: {e}")
             log_on_main_process(logger, "KL computation may not work correctly. Consider using a separate ref_model.")
 
-    # Step 6: EMA (FSDP-aware EMA, same as train_osp_RL.py)
     log_on_main_process(logger, "Initializing EMA model...")
     ema_model = EMAModel(model, decay=ema_decay, update_interval=ema_update_interval)
     _lora_ema_keys = {n for n, _ in model.named_parameters() if 'lora_' in n}
-    _orig_ema_update = ema_model.update
 
     @torch.no_grad()
     def _lora_only_ema_update(model, step):
@@ -1084,7 +914,6 @@ def main(config):
     ema_model.update = _lora_only_ema_update
     log_on_main_process(logger, f"EMA model initialized (LoRA-only update, {len(_lora_ema_keys)} LoRA keys), memory: {get_memory_allocated()} GiB")
 
-    # Step 7: Checkpointer
     checkpointer = Checkpointer(folder=output_dir, dcp_api=save_with_dcp_api)
     if checkpointer.last_training_iteration is not None:
         log_on_main_process(logger, "Loading model checkpoint...")
@@ -1095,15 +924,9 @@ def main(config):
         ema_model.model_copy_to_ema(model)
         ema_model.restore(model)
         has_loaded_pretrained_model = True
-    # NOTE: base model checkpoint file loading has been moved to Step 1 (before LoRA/FSDP2 wrapping)
-    # to avoid key name mismatch between raw checkpoint keys and PEFT-wrapped model keys.
-
     if not has_loaded_pretrained_model:
         log_on_main_process(logger, f"Warning! Training from scratch, pretrained_model_dir_or_checkpoint={pretrained_model_dir_or_checkpoint}")
 
-    # Step 8: Optimizer (only LoRA params)
-    # Since we keep all params requires_grad=True for FSDP2 compatibility,
-    # we identify LoRA params by name (lora_A, lora_B) to pass to the optimizer.
     log_on_main_process(logger, "Initializing optimizer...")
     learning_rate = optimizer_config.get("lr", 5e-4)
     weight_decay_val = optimizer_config.get("weight_decay", 1e-2)
@@ -1185,35 +1008,12 @@ def main(config):
 
     set_seed(seed, device_specific=True, process_group=dp_group, deterministic=deterministic_training)
 
-    # ========== RL Dataset & Reward ====================
     log_on_main_process(logger, f"Initializing reward functions with config: {reward_fn_config}")
-    import sys
-    try:
-        print(f"[Rank {rank}] Importing ospnext.rewards.rewards ...", flush=True)
-        sys.stdout.flush()
-        sys.stderr.flush()
-        import ospnext.rewards.rewards
-        print(f"[Rank {rank}] Import successful, calling multi_score ...", flush=True)
-        sys.stdout.flush()
-        sys.stderr.flush()
-        reward_fn = getattr(ospnext.rewards.rewards, 'multi_score')(device, reward_fn_config)
-        print(f"[Rank {rank}] multi_score initialized successfully.", flush=True)
-        sys.stdout.flush()
-        sys.stderr.flush()
-    except Exception as e:
-        log_on_main_process(logger, f"ERROR: Failed to import ospnext.rewards.rewards: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.stdout.flush()
-        sys.stderr.flush()
-        def reward_fn(videos, prompts, metadata, only_strict=True):
-            B = len(prompts)
-            return {"avg": np.ones(B, dtype=np.float32)}, {}
-    # Synchronize all ranks after reward init to catch early failures
+    import torchdiff.rewards.rewards
+    reward_fn = getattr(torchdiff.rewards.rewards, 'multi_score')(device, reward_fn_config)
     dist.barrier()
     log_on_main_process(logger, "All ranks passed reward initialization.")
 
-    # Prompt dataset
     text_tokenizer_path = data_config.get("dataset_config", {}).get("text_tokenizer_path", None)
     text_max_length = data_config.get("dataset_config", {}).get("tokenizer_max_length", text_encoder_config.get("text_len", 512))
     if text_tokenizer_path is None:
@@ -1227,9 +1027,8 @@ def main(config):
         text_max_length=text_max_length,
     )
 
-    # dp_size and dp_rank
-    dp_size = dp_group.size() if use_global_sequence_parallel else world_size
-    dp_rank = dist.get_rank(dp_group) if use_global_sequence_parallel else rank
+    dp_size = dp_group.size() if use_global_context_parallel else world_size
+    dp_rank = dist.get_rank(dp_group) if use_global_context_parallel else rank
 
     train_sampler = DistributedKRepeatSampler(
         dataset=train_dataset,
@@ -1246,26 +1045,9 @@ def main(config):
         collate_fn=TextPromptDataset.collate_fn,
     )
 
-    # # Eval dataset
-    # test_dataloader = None
-    # if eval_prompt_file is not None:
-    #     eval_dataset = TextPromptDataset(
-    #         file_path=eval_prompt_file,
-    #         text_tokenizer_path=text_tokenizer_path,
-    #         text_max_length=text_max_length,
-    #     )
-    #     test_dataloader = DataLoader(
-    #         eval_dataset,
-    #         batch_size=sample_batch_size,
-    #         collate_fn=TextPromptDataset.collate_fn,
-    #         shuffle=False,
-    #         num_workers=4,
-    #     )
-
-    # Eval dataset
     test_dataloader = None
     eval_sampler = None
-    ddp_rank_for_eval, fsdp_local_rank, ddp_size_for_eval = get_ddp_rank_and_fsdp_local_rank(
+    ddp_rank_for_eval, _, ddp_size_for_eval = get_ddp_rank_and_fsdp_local_rank(
         rank=rank,
         fsdp_size=fsdp_size,
         world_size=world_size,
@@ -1278,9 +1060,6 @@ def main(config):
             text_max_length=text_max_length,
         )
 
-        # Important:
-        # - FSDP ranks inside the same replica must see the same eval batches
-        # - Different DDP replicas should see different eval subsets
         eval_sampler = DistributedSampler(
             eval_dataset,
             num_replicas=ddp_size_for_eval,
@@ -1298,15 +1077,12 @@ def main(config):
             pin_memory=True,
         )
 
-    # Stat tracker
     if num_image_per_prompt * sample_time_per_prompt <= 1:
         per_prompt_stat_tracking = False
     stat_tracker = PerPromptStatTracker(global_std=global_std) if per_prompt_stat_tracking else None
 
-    # Negative text embedding for CFG
-    # Use the real NEGATIVE_PROMPT text (consistent with the inference pipeline) instead of an all-zero token.
     log_on_main_process(logger, "Computing negative text embedding...")
-    from ospnext.utils.constant import NEGATIVE_PROMPT
+    from torchdiff.utils.constant import NEGATIVE_PROMPT
     neg_text_processor = WanTextProcessor(
         tokenizer=AutoTokenizer.from_pretrained(text_tokenizer_path),
         model_max_length=text_max_length,
@@ -1318,21 +1094,16 @@ def main(config):
     with torch.no_grad():
         neg_text_embeddings = text_encoder(neg_prompt_ids, neg_prompt_mask)
 
-    # Number of training timesteps per trajectory
-    # Only the SDE steps are trained; timestep_fraction further controls the training ratio within the SDE step range.
     num_train_timesteps = int(sde_steps * timestep_fraction)
     train_timestep_indices = list(range(num_train_timesteps))
 
-    # Sigma schedule
     sigmas_schedule = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
     if hasattr(scheduler, 'shift') and scheduler.shift != 1.0:
         shift = scheduler.shift
         sigmas_schedule = shift * sigmas_schedule / (1 + (shift - 1) * sigmas_schedule)
 
-    # Executor for async reward computation
     executor = futures.ThreadPoolExecutor(max_workers=8)
 
-    # ========== Logging ==========
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     log_on_main_process(logger, f"""
@@ -1372,12 +1143,12 @@ def main(config):
     DDP size: {ddp_size}
     World size: {world_size}
     dp_size: {dp_size}
-    sp_size: {sp_size}
-    skiparse_sp_size: {skiparse_sp_size}
-    global_sp_size: {global_sp_size}
-    Use Sequence Parallel: {use_sequence_parallel}
-    Use Skiparse Sequence Parallel: {use_skiparse_sequence_parallel}
-    Use Full Blocks Sequence Parallel: {use_full_blocks_sequence_parallel}
+    cp_size: {cp_size}
+    skiparse_cp_size: {skiparse_cp_size}
+    global_cp_size: {global_cp_size}
+    Use Context Parallel: {use_context_parallel}
+    Use Skiparse Context Parallel: {use_skiparse_context_parallel}
+    Use Full Blocks Context Parallel: {use_full_blocks_context_parallel}
     Reshard after forward: {reshard_after_forward}
     Model CPU offload: {model_cpu_offload}
     Video: {video_num_frames}f x {video_height}h x {video_width}w
@@ -1385,12 +1156,10 @@ def main(config):
     {'=' * 20}{'=' * len('Start RL Training (GRPO + LoRA + FSDP2)')}{'=' * 20}
     """)
 
-    # ========== Training Loop ==========
     global_step = resume_global_step
     last_completed_epoch = start_epoch - 1
     train_iter = iter(train_dataloader)
 
-    # Compute latent shape
     vae_temporal_factor = 4
     vae_spatial_factor = 8
     latent_T = (video_num_frames - 1) // vae_temporal_factor + 1
@@ -1401,60 +1170,12 @@ def main(config):
 
     log_on_main_process(logger, f"Latent shape: {latent_shape}")
 
-    # Number of training timesteps determines gradient accumulation
     accum_steps_total = gradient_accumulation_steps * num_train_timesteps
 
     for epoch in range(start_epoch, num_epochs):
-        # ==================== SAMPLING PHASE ====================
+        ### — — — — — — Sample — — — — — — 
         model.eval()
 
-        # ===== Sample phase: disable SP / skiparse_sp, only use DDP =====
-        import ospnext.distributed.sp_state as _sp_state_module
-        _saved_sp_state = {
-            'global_sp_group': sp_state.global_sp_group,
-            'global_sp_rank': sp_state.global_sp_rank,
-            'global_sp_size': sp_state.global_sp_size,
-            'sp_group': sp_state.sp_group,
-            'sp_rank': sp_state.sp_rank,
-            'sp_size': sp_state.sp_size,
-            'skiparse_sp_group': sp_state.skiparse_sp_group,
-            'skiparse_sp_rank': sp_state.skiparse_sp_rank,
-            'skiparse_sp_size': sp_state.skiparse_sp_size,
-            'full_sp_group': sp_state.full_sp_group,
-            'full_sp_rank': sp_state.full_sp_rank,
-            'full_sp_size': sp_state.full_sp_size,
-            'is_initialized': sp_state.is_initialized,
-        }
-
-        if use_global_sequence_parallel:
-            log_on_main_process(logger, "Sample phase: keeping skiparse_sp, disabling ulysses SP only")
-            # Only disable Ulysses SP; keep skiparse_sp active for the sampling phase.
-            if use_sequence_parallel:
-                # Clear Ulysses SP state
-                sp_state.sp_group = None
-                sp_state.sp_rank = 0
-                sp_state.sp_size = 1
-                # global_sp degenerates to skiparse_sp
-                sp_state.global_sp_group = sp_state.skiparse_sp_group
-                sp_state.global_sp_rank = sp_state.skiparse_sp_rank
-                sp_state.global_sp_size = sp_state.skiparse_sp_size
-                # full blocks SP degenerates to no SP (only skiparse blocks use skiparse_sp)
-                sp_state.full_sp_group = None
-                sp_state.full_sp_rank = 0
-                sp_state.full_sp_size = 1
-
-            base_model_inner = model.get_base_model() if hasattr(model, 'get_base_model') else model
-            if hasattr(base_model_inner, 'rope_wrapper') and base_model_inner.rope_wrapper is not None:
-                base_model_inner.rope_wrapper.cache.clear()
-            if hasattr(base_model_inner, 'mask_preprocessor'):
-                base_model_inner.mask_preprocessor.cache.clear()
-            if hasattr(base_model_inner, 'context_preprocessor'):
-                base_model_inner.context_preprocessor.shard_seq_lens_cache.clear()
-            dist.barrier()
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-
-        # Enable reshard_after_forward=True in the sampling phase so FSDP parameters are not kept unsharded.
         if reshard_after_forward is not None and not reshard_after_forward:
             model.set_reshard_after_forward(True, recurse=True)
 
@@ -1481,7 +1202,6 @@ def main(config):
                 if not text_encoder_use_fsdp:
                     text_encoder.model.to(device)
 
-            # Encode prompts
             with torch.no_grad():
                 text_embeddings = text_encoder(prompt_ids, prompt_mask)
             torch.cuda.synchronize()
@@ -1492,34 +1212,11 @@ def main(config):
                     text_encoder.model.to("cpu")
                 torch.cuda.empty_cache()
 
-            # Save/eval checkpoint
-            # if batch_idx == 0 and epoch % save_interval == 0 and epoch > 0:
-            #     log_on_main_process(logger, f"Saving checkpoint at epoch {epoch}...")
-            #     checkpointer.save(model, optimizer, None, epoch)
-            #     ema_model.store(model)
-            #     ema_model.ema_copy_to_model(model)
-            #     checkpointer.save_ema_model(model, epoch)
-            #     ema_model.restore(model)
-            #     adaptive_grad_clipper.save(output_dir=f"{output_dir}/{checkpoint_prefix}{epoch:09d}")
-            #     # Also save LoRA-specific checkpoint
-            #     if hasattr(model, 'save_pretrained'):
-            #         save_lora_checkpoint(model, output_dir, epoch)
-            #     torch.cuda.synchronize()
-            #     torch.cuda.empty_cache()
-
-            # Skip first 2 epochs (collecting group statistics)
-            # if epoch < 2:
-            #     continue
-
-            # Free GPU memory
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-            # Sample
             for sample_t in range(sample_time_per_prompt):
                 with torch.no_grad():
-                    # In sample phase we use skiparse_sp; pass skiparse_sp_group to synchronize the initial noise.
-                    _sample_sp_group = skiparse_sp_group if use_skiparse_sequence_parallel else None
                     videos, latents_list, log_probs_list, kl_list = osp_sample_with_logprob(
                         model=model,
                         scheduler=scheduler,
@@ -1532,24 +1229,21 @@ def main(config):
                         guidance_scale=guidance_scale,
                         negative_text_embeddings=neg_text_embeddings.expand(sample_batch_size, -1, -1),
                         start_frame_latents=None,
-                        determistic=False,
+                        deterministic=False,
                         kl_reward=kl_reward,
-                        sp_group=_sample_sp_group,
+                        cp_group=global_cp_group,
                         sde_steps=sde_steps,
                     )
 
-                # Stack latents and log_probs (only SDE steps)
                 latents_stacked = torch.stack(latents_list, dim=1)
                 log_probs_stacked = torch.stack(log_probs_list, dim=1)
                 kl_stacked = torch.stack(kl_list, dim=1)
                 del latents_list, log_probs_list, kl_list
 
-                # timesteps only correspond to SDE steps
                 timesteps_repeated = torch.arange(sde_steps, device=device).unsqueeze(0).expand(
                     sample_batch_size, -1
                 )
 
-                # Compute rewards asynchronously
                 videos_cpu = videos.detach().cpu()
                 del videos
                 videos_for_reward = (videos_cpu.float() + 1.0) / 2.0
@@ -1558,7 +1252,6 @@ def main(config):
                 )
                 del videos_for_reward
 
-                # Save last batch for wandb
                 last_videos_cpu = videos_cpu
                 last_prompts = list(prompts)
 
@@ -1577,36 +1270,6 @@ def main(config):
 
             del text_embeddings, prompt_ids, prompt_mask
 
-        # ===== Sample phase done, restore SP state for training =====
-        if use_global_sequence_parallel:
-            log_on_main_process(logger, "Sample phase done: restoring SP state for training")
-            sp_state.global_sp_group = _saved_sp_state['global_sp_group']   
-            sp_state.global_sp_rank = _saved_sp_state['global_sp_rank']
-            sp_state.global_sp_size = _saved_sp_state['global_sp_size']
-            sp_state.sp_group = _saved_sp_state['sp_group']
-            sp_state.sp_rank = _saved_sp_state['sp_rank']
-            sp_state.sp_size = _saved_sp_state['sp_size']
-            sp_state.skiparse_sp_group = _saved_sp_state['skiparse_sp_group']
-            sp_state.skiparse_sp_rank = _saved_sp_state['skiparse_sp_rank']
-            sp_state.skiparse_sp_size = _saved_sp_state['skiparse_sp_size']
-            sp_state.full_sp_group = _saved_sp_state['full_sp_group']
-            sp_state.full_sp_rank = _saved_sp_state['full_sp_rank']
-            sp_state.full_sp_size = _saved_sp_state['full_sp_size']
-            sp_state.is_initialized = _saved_sp_state['is_initialized']
-            base_model_inner = model.get_base_model() if hasattr(model, 'get_base_model') else model
-            if hasattr(base_model_inner, 'rope_wrapper') and base_model_inner.rope_wrapper is not None:
-                base_model_inner.rope_wrapper.cache.clear()
-            if hasattr(base_model_inner, 'mask_preprocessor'):
-                base_model_inner.mask_preprocessor.cache.clear()
-            if hasattr(base_model_inner, 'context_preprocessor'):
-                base_model_inner.context_preprocessor.shard_seq_lens_cache.clear()
-            dist.barrier()
-            torch.cuda.synchronize()
-
-        # if epoch < 2:
-        #     continue
-
-        # Wait for all rewards
         for sample in tqdm(samples, desc="Waiting for rewards", disable=(rank != 0)):
             rewards, reward_metadata = sample["rewards"].result()
             sample["rewards"] = {
@@ -1614,7 +1277,6 @@ def main(config):
                 for key, value in rewards.items()
             }
 
-        # Collate samples
         samples = {
             k: torch.cat([s[k] for s in samples], dim=0)
             if not isinstance(samples[0][k], dict)
@@ -1625,8 +1287,7 @@ def main(config):
             for k in samples[0].keys()
         }
 
-        # Log videos
-        if epoch % 1 == 0 and rank == 0 and last_videos_cpu is not None:
+        if rank == 0 and last_videos_cpu is not None:
             with tempfile.TemporaryDirectory() as tmpdir:
                 num_vis = min(8, len(last_videos_cpu))
                 sample_indices = random.sample(range(len(last_videos_cpu)), num_vis)
@@ -1645,7 +1306,6 @@ def main(config):
                         step=global_step,
                     )
 
-        # Apply KL penalty to rewards
         samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
         kl_on_device = samples["kl"].to(device)
         num_steps_dim = kl_on_device.shape[1] if kl_on_device.dim() > 1 else sde_steps
@@ -1653,17 +1313,15 @@ def main(config):
         samples["rewards"]["avg"] = avg_expanded - kl_reward * kl_on_device
         del kl_on_device
 
-        # Gather rewards across dp ranks
         gathered_rewards = {}
         for key, value in samples["rewards"].items():
             if value.dim() == 1:
-                gathered = gather_data_from_all_ranks(value.unsqueeze(0), dim=0, group=dp_group if use_global_sequence_parallel else None)
+                gathered = gather_data_from_all_ranks(value.unsqueeze(0), dim=0, group=dp_group if use_global_context_parallel else None)
                 gathered_rewards[key] = gathered.reshape(-1).cpu().numpy()
             else:
-                gathered = gather_data_from_all_ranks(value, dim=0, group=dp_group if use_global_sequence_parallel else None)
+                gathered = gather_data_from_all_ranks(value, dim=0, group=dp_group if use_global_context_parallel else None)
                 gathered_rewards[key] = gathered.reshape(-1, *value.shape[1:]).cpu().numpy()
 
-        # Log rewards
         if rank == 0:
             log_dict = {
                 "epoch": epoch,
@@ -1672,7 +1330,6 @@ def main(config):
             }
 
             for key, value in gathered_rewards.items():
-                # value is a numpy array
                 if '_strict_accuracy' not in key and '_accuracy' not in key:
                     log_dict[f"reward_{key}"] = float(value.mean())
                     log_dict[f"reward/{key}_mean"] = float(value.mean())
@@ -1684,10 +1341,9 @@ def main(config):
             if wandb.run is not None:
                 wandb.log(log_dict, step=global_step)
 
-        # Compute advantages
         if per_prompt_stat_tracking and stat_tracker is not None:
             gathered_prompts_list = [None] * dp_size
-            if use_global_sequence_parallel:
+            if use_global_context_parallel:
                 dist.all_gather_object(gathered_prompts_list, all_prompts, group=dp_group)
             else:
                 dist.all_gather_object(gathered_prompts_list, all_prompts)
@@ -1707,10 +1363,8 @@ def main(config):
             avg_rewards = gathered_rewards['ori_avg']
             advantages = (avg_rewards - avg_rewards.mean()) / (avg_rewards.std() + 1e-4)
 
-        # Redistribute advantages
         advantages = torch.as_tensor(advantages).float()
 
-        # Log advantage statistics (global advantages, before redistribute)
         if rank == 0:
             adv_mean = advantages.mean().item()
             adv_std = advantages.std().item()
@@ -1739,7 +1393,6 @@ def main(config):
 
         del samples["rewards"]
 
-        # Mask out zero-advantage samples
         mask = (samples["advantages"].abs().sum(dim=1) != 0) if samples["advantages"].dim() > 1 else (samples["advantages"].abs() != 0)
 
         num_batches_total = num_batches_per_epoch * sample_time_per_prompt
@@ -1758,29 +1411,19 @@ def main(config):
         samples = {k: v[mask] for k, v in samples.items()}
 
         total_batch_size_local = len(samples["timesteps"])
-        num_timesteps = samples["timesteps"].shape[1] if samples["timesteps"].dim() > 1 else num_train_timesteps
 
-        # ==================== TRAINING PHASE ====================
         backward_counter = 0
 
         for inner_epoch in range(num_inner_epochs):
             model.train()
-            # Training phase: restore original reshard_after_forward setting
             if reshard_after_forward is not None and not reshard_after_forward:
                 model.set_reshard_after_forward(reshard_after_forward, recurse=True)
 
-            # Directly use log_probs saved from sample phase as old policy baseline.
-            # No RECOMPUTE: log_probs from sample phase are generated by the LoRA model at that time,
-            # as the LoRA weights are updated during training, the log_prob recalculated in the training phase
-            # will gradually differ from the log_probs at the time of sampling, causing the ratio to deviate from 1.0, and the PPO clip mechanism to take effect.
-
-            # Shuffle along batch dimension (samples are on CPU)
             perm = torch.randperm(total_batch_size_local, device=device)
-            # Synchronize the perm indices: as long as ranks within the same SP group take data in the exact same order, every micro_batch input stays consistent, avoiding the communication cost of broadcasting huge latents.
-            if use_global_sequence_parallel:
-                torch.distributed.broadcast(perm, group_src=0, group=global_sp_group)
+            if use_global_context_parallel:
+                torch.distributed.broadcast(perm, src=dist.get_global_rank(global_cp_group, 0), group=global_cp_group)
             perm = perm.cpu()
-            
+
             samples = {
                 k: (
                     {sub_k: sub_v[perm] for sub_k, sub_v in v.items()}
@@ -1790,12 +1433,6 @@ def main(config):
                 for k, v in samples.items()
             }
 
-            # Note: do not shuffle along time dimension.
-            # Because compute_log_prob_for_training uses sigmas_schedule[step_idx]
-            # as timestep (fixed mapping j → sigma_j), if shuffling along time dimension,
-            # latents[:, j] will no longer correspond to timestep j, causing sigma and latent mismatch.
-
-            # Split into micro-batches
             num_micro_batches = max(1, total_batch_size_local // train_batch_size)
 
             info = defaultdict(list)
@@ -1832,9 +1469,9 @@ def main(config):
                             guidance_scale=guidance_scale if use_cfg_in_train else 1.0,
                             negative_text_embeddings=neg_embeds,
                             start_frame_latents=None,
+                            cp_group=global_cp_group,
                         )
 
-                        # KL regularization against ref model (LoRA disabled)
                         if kl_beta > 0:
                             with torch.no_grad():
                                 with model.disable_adapter():
@@ -1849,9 +1486,9 @@ def main(config):
                                         guidance_scale=guidance_scale if use_cfg_in_train else 1.0,
                                         negative_text_embeddings=neg_embeds,
                                         start_frame_latents=None,
+                                        cp_group=global_cp_group,
                                     )
 
-                    # GRPO loss
                     if micro_batch["advantages"].dim() > 1:
                         adv = torch.clamp(micro_batch["advantages"][:, j], -adv_clip_max, adv_clip_max)
                     else:
@@ -1863,14 +1500,13 @@ def main(config):
                     policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
                     if kl_beta > 0:
-                        kl_loss = ((prev_sample_mean - ref_prev_sample_mean) ** 2).mean(dim=(1, 2, 3), keepdim=True) / (2 * (std_dev_t * ref_dt) ** 2)
+                        kl_loss = ((prev_sample_mean - ref_prev_sample_mean) ** 2).mean(dim=(1, 2, 3, 4)) / (2 * (std_dev_t * dt) ** 2).squeeze()
                         kl_loss = torch.mean(kl_loss)
                         loss = policy_loss + kl_beta * kl_loss
                         info["kl_loss"].append(kl_loss.detach())
                     else:
                         loss = policy_loss
 
-                    # Scale loss for gradient accumulation
                     loss = loss / accum_steps_total
                     loss.backward()
 
@@ -1885,35 +1521,13 @@ def main(config):
 
                     backward_counter += 1
 
-                    # Optimizer step
                     if backward_counter % accum_steps_total == 0:
-                        # --- DEBUG: check LoRA gradient before optimizer step ---
-                        if rank == 0 and global_step < 3:
-                            for _dn, _dp in model.named_parameters():
-                                if 'lora_' in _dn:
-                                    _local = _dp.grad._local_tensor if isinstance(_dp.grad, DTensor) else (_dp.grad if _dp.grad is not None else None)
-                                    if _local is not None:
-                                        print(f"[DEBUG grad] {_dn}: grad_norm={_local.norm().item():.8f}, "
-                                              f"param_norm={(_dp._local_tensor if isinstance(_dp, DTensor) else _dp).norm().item():.8f}")
-                                    else:
-                                        print(f"[DEBUG grad] {_dn}: grad is None!")
-                                    break
-                        # --- END DEBUG ---
                         grad_norm = adaptive_grad_clipper.adaptive_clip(trainable_parameters)
                         optimizer.step()
                         model.zero_grad(set_to_none=True)
-                        # --- DEBUG: check LoRA param after optimizer step ---
-                        if rank == 0 and global_step < 3:
-                            for _dn, _dp in model.named_parameters():
-                                if 'lora_' in _dn:
-                                    _local = _dp._local_tensor if isinstance(_dp, DTensor) else _dp
-                                    print(f"[DEBUG post-step] {_dn}: param_norm={_local.norm().item():.8f}")
-                                    break
-                        # --- END DEBUG ---
                         ema_model.update(model, global_step + 1)
                         global_step += 1
 
-                        # Log
                         if len(info) > 0:
                             info_mean = {k: torch.mean(torch.stack(v)).item() for k, v in info.items()}
                             if rank == 0:
@@ -1939,7 +1553,6 @@ def main(config):
                                     wandb.log(wandb_log, step=global_step)
                             info = defaultdict(list)
 
-            # Handle remaining gradients
             if backward_counter % accum_steps_total != 0:
                 grad_norm = adaptive_grad_clipper.adaptive_clip(trainable_parameters)
                 optimizer.step()
@@ -1973,12 +1586,10 @@ def main(config):
                             wandb.log(wandb_log, step=global_step)
                     info = defaultdict(list)
 
-        # Synchronize and clean up after the training phase finishes.
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         dist.barrier()
 
-        # Save checkpoint periodically
         if epoch > 0 and epoch % save_interval == 0:
             log_on_main_process(logger, f"Saving checkpoint at epoch {epoch} (global_step {global_step})...")
             checkpointer.save(model, optimizer, None, global_step)
@@ -1988,51 +1599,23 @@ def main(config):
             ema_model.restore(model)
             adaptive_grad_clipper.save(output_dir=f"{output_dir}/{checkpoint_prefix}{global_step:09d}")
             save_rl_training_state(output_dir, global_step, epoch + 1)
-            # Also save LoRA-specific checkpoint
             if hasattr(model, 'save_pretrained'):
                 save_lora_checkpoint(model, output_dir, global_step)
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
         last_completed_epoch = epoch
 
-        # ==================== EVAL PHASE ====================
         if (test_dataloader is not None
                 and global_step > 0
                 and global_step % eval_freq == 0):
             log_on_main_process(logger, f"[Eval] Running eval video generation at global_step {global_step}...")
             model.eval()
 
-            # Switch to EMA weights
             ema_model.store(model)
             ema_model.ema_copy_to_model(model)
 
-            # Eval phase also needs reshard_after_forward=True
             if reshard_after_forward is not None and not reshard_after_forward:
                 model.set_reshard_after_forward(True, recurse=True)
-
-            # Disable SP (consistent with the sample phase: only disable Ulysses SP, keep skiparse_sp)
-            if use_global_sequence_parallel:
-                log_on_main_process(logger, "[Eval] keeping skiparse_sp, disabling ulysses SP only")
-                if use_sequence_parallel:
-                    sp_state.sp_group = None
-                    sp_state.sp_rank = 0
-                    sp_state.sp_size = 1
-                    sp_state.global_sp_group = sp_state.skiparse_sp_group
-                    sp_state.global_sp_rank = sp_state.skiparse_sp_rank
-                    sp_state.global_sp_size = sp_state.skiparse_sp_size
-                    sp_state.full_sp_group = sp_state.skiparse_sp_group
-                    sp_state.full_sp_rank = sp_state.skiparse_sp_rank
-                    sp_state.full_sp_size = sp_state.skiparse_sp_size
-                base_model_inner = model.get_base_model() if hasattr(model, 'get_base_model') else model
-                if hasattr(base_model_inner, 'rope_wrapper') and base_model_inner.rope_wrapper is not None:
-                    base_model_inner.rope_wrapper.cache.clear()
-                if hasattr(base_model_inner, 'mask_preprocessor'):
-                    base_model_inner.mask_preprocessor.cache.clear()
-                if hasattr(base_model_inner, 'context_preprocessor'):
-                    base_model_inner.context_preprocessor.shard_seq_lens_cache.clear()
-                dist.barrier()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
 
             eval_videos_cpu = []
             eval_prompts = []
@@ -2060,12 +1643,6 @@ def main(config):
                 eval_latent_shape = (len(eval_prompt_texts), latent_C, latent_T, latent_H, latent_W)
 
                 with torch.no_grad():
-                    # In the eval phase we keep skiparse_sp (and optionally full_sp) active,
-                    # so the initial noise must be synchronized across the active SP group.
-                    # ``sp_state.global_sp_group`` was already retargeted to ``skiparse_sp_group``
-                    # above when ``use_sequence_parallel`` is True; otherwise it stays as the
-                    # restored training group.
-                    _eval_sp_group = sp_state.global_sp_group if (use_global_sequence_parallel and sp_state.global_sp_size > 1) else None
                     eval_videos = osp_sample_deterministic(
                         model=model,
                         scheduler=scheduler,
@@ -2078,7 +1655,6 @@ def main(config):
                         guidance_scale=guidance_scale,
                         negative_text_embeddings=neg_text_embeddings.expand(len(eval_prompt_texts), -1, -1),
                         start_frame_latents=None,
-                        sp_group=_eval_sp_group,
                     )
 
                 eval_videos_cpu.append(eval_videos.detach().cpu())
@@ -2088,39 +1664,11 @@ def main(config):
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 
-            # Restore SP state
-            if use_global_sequence_parallel:
-                sp_state.global_sp_group = _saved_sp_state['global_sp_group']
-                sp_state.global_sp_rank = _saved_sp_state['global_sp_rank']
-                sp_state.global_sp_size = _saved_sp_state['global_sp_size']
-                sp_state.sp_group = _saved_sp_state['sp_group']
-                sp_state.sp_rank = _saved_sp_state['sp_rank']
-                sp_state.sp_size = _saved_sp_state['sp_size']
-                sp_state.skiparse_sp_group = _saved_sp_state['skiparse_sp_group']
-                sp_state.skiparse_sp_rank = _saved_sp_state['skiparse_sp_rank']
-                sp_state.skiparse_sp_size = _saved_sp_state['skiparse_sp_size']
-                sp_state.full_sp_group = _saved_sp_state['full_sp_group']
-                sp_state.full_sp_rank = _saved_sp_state['full_sp_rank']
-                sp_state.full_sp_size = _saved_sp_state['full_sp_size']
-                sp_state.is_initialized = _saved_sp_state['is_initialized']
-                base_model_inner = model.get_base_model() if hasattr(model, 'get_base_model') else model
-                if hasattr(base_model_inner, 'rope_wrapper') and base_model_inner.rope_wrapper is not None:
-                    base_model_inner.rope_wrapper.cache.clear()
-                if hasattr(base_model_inner, 'mask_preprocessor'):
-                    base_model_inner.mask_preprocessor.cache.clear()
-                if hasattr(base_model_inner, 'context_preprocessor'):
-                    base_model_inner.context_preprocessor.shard_seq_lens_cache.clear()
-                dist.barrier()
-                torch.cuda.synchronize()
-
-            # Restore the reshard_after_forward setting
             if reshard_after_forward is not None and not reshard_after_forward:
                 model.set_reshard_after_forward(reshard_after_forward, recurse=True)
 
-            # Restore training weights
             ema_model.restore(model)
 
-            # Log eval videos to wandb (only on rank 0)
             if rank == 0 and len(eval_videos_cpu) > 0:
                 eval_all_videos = torch.cat(eval_videos_cpu, dim=0)
                 with tempfile.TemporaryDirectory() as tmpdir:
@@ -2153,7 +1701,6 @@ def main(config):
 
             log_on_main_process(logger, f"[Eval] Eval video generation done at global_step {global_step}.")
 
-    # ========== Final save ==========
     completed_epochs = max(start_epoch, last_completed_epoch + 1)
     log_on_main_process(logger, f"Saving final checkpoint at global_step {global_step}...")
     checkpointer.save(model, optimizer, None, global_step)
@@ -2163,7 +1710,6 @@ def main(config):
     ema_model.restore(model)
     adaptive_grad_clipper.save(output_dir=f"{output_dir}/{checkpoint_prefix}{global_step:09d}")
     save_rl_training_state(output_dir, global_step, completed_epochs)
-    # Also save LoRA-specific checkpoint
     if hasattr(model, 'save_pretrained'):
         save_lora_checkpoint(model, output_dir, global_step)
 
