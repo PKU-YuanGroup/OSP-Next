@@ -14,7 +14,7 @@ A scalable **sparse** text-to-video diffusion model, introducing **Skiparse-2D A
 
 </div>
 
-<h5 align="left">
+<h5 align="center">
 
 [![arXiv](https://img.shields.io/badge/Arxiv-OSP--Next-b31b1b.svg?logo=arXiv)](<ARXIV_URL>)
 [![arXiv](https://img.shields.io/badge/Arxiv-Open--Sora%20Plan-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2412.00131)
@@ -204,22 +204,22 @@ cell to play the video right inside the page.
   </thead>
   <tbody>
     <tr>
-      <td><sub><i>"A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage..."</i></sub></td>
-      <td align="center"><video src="<DEMO_WAN21_1>"     width="240" controls muted loop playsinline preload="metadata"></video></td>
-      <td align="center"><video src="<DEMO_OSP_1>"       width="240" controls muted loop playsinline preload="metadata"></video></td>
-      <td align="center"><video src="<DEMO_OSP_HIF8_1>"  width="240" controls muted loop playsinline preload="metadata"></video></td>
+      <td><sub><i>"A handheld 35mm camera holds an extreme close-up on a gray-haired, bearded man in his sixties..."</i></sub></td>
+      <td align="center"><video src="https://github.com/user-attachments/assets/284d227d-b0c7-4f54-9930-b466095725a5"     width="240" controls muted loop playsinline preload="metadata"></video></td>
+      <td align="center"><video src="https://github.com/user-attachments/assets/8d9a85f9-75f0-4eaa-a01d-a81ccdffc659"       width="240" controls muted loop playsinline preload="metadata"></video></td>
+      <td align="center"><video src="https://github.com/user-attachments/assets/e4388ced-20c5-4836-9c66-cdba5b9eeb7f"  width="240" controls muted loop playsinline preload="metadata"></video></td>
     </tr>
     <tr>
-      <td><sub><i>"Several giant wooly mammoths approach treading through a snowy meadow..."</i></sub></td>
-      <td align="center"><video src="<DEMO_WAN21_2>"     width="240" controls muted loop playsinline preload="metadata"></video></td>
-      <td align="center"><video src="<DEMO_OSP_2>"       width="240" controls muted loop playsinline preload="metadata"></video></td>
-      <td align="center"><video src="<DEMO_OSP_HIF8_2>"  width="240" controls muted loop playsinline preload="metadata"></video></td>
+      <td><sub><i>"A cream and sable corgi, sporting sleek jet-black sunglasses, trots confidently along a pristine tropical beach..."</i></sub></td>
+      <td align="center"><video src="https://github.com/user-attachments/assets/85a4fd1c-d098-4b25-a28d-15a46d64bfb4"     width="240" controls muted loop playsinline preload="metadata"></video></td>
+      <td align="center"><video src="https://github.com/user-attachments/assets/86f30f13-09ee-40d3-bbae-0d0627a939ae"       width="240" controls muted loop playsinline preload="metadata"></video></td>
+      <td align="center"><video src="https://github.com/user-attachments/assets/e05827a9-f93b-4fcb-8f65-29749668b60d"  width="240" controls muted loop playsinline preload="metadata"></video></td>
     </tr>
     <tr>
-      <td><sub><i>"Drone view of waves crashing against the rugged cliffs along Big Sur's garay point beach..."</i></sub></td>
-      <td align="center"><video src="<DEMO_WAN21_3>"     width="240" controls muted loop playsinline preload="metadata"></video></td>
-      <td align="center"><video src="<DEMO_OSP_3>"       width="240" controls muted loop playsinline preload="metadata"></video></td>
-      <td align="center"><video src="<DEMO_OSP_HIF8_3>"  width="240" controls muted loop playsinline preload="metadata"></video></td>
+      <td><sub><i>"A lone 30-year-old space man strides across an endless salt desert under a vast, electric-blue sky..."</i></sub></td>
+      <td align="center"><video src="https://github.com/user-attachments/assets/51026d0d-075a-45d4-b668-598614cfadcd"     width="240" controls muted loop playsinline preload="metadata"></video></td>
+      <td align="center"><video src="https://github.com/user-attachments/assets/def9c76b-829e-4cc4-9781-e6e252a34087"       width="240" controls muted loop playsinline preload="metadata"></video></td>
+      <td align="center"><video src="https://github.com/user-attachments/assets/16e6ef65-cdc9-4811-822e-0655f72ab300"  width="240" controls muted loop playsinline preload="metadata"></video></td>
     </tr>
   </tbody>
 </table>
