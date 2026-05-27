@@ -14,7 +14,7 @@ from argparse import ArgumentParser
 import wandb
 import imageio
 
-from torchdiff.utils.utils import check_and_import_npu
+from ospnext.utils.utils import check_and_import_npu
 import torch
 check_and_import_npu()
 
@@ -25,18 +25,18 @@ from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
-from torchdiff.utils.log_utils import get_logger, log_on_main_process, verify_min_gpu_count
-from torchdiff.utils.random_utils import set_seed
-from torchdiff.distributed.utils import (
+from ospnext.utils.log_utils import get_logger, log_on_main_process, verify_min_gpu_count
+from ospnext.utils.random_utils import set_seed
+from ospnext.distributed.utils import (
     setup_distributed_env,
     cleanup_distributed_env,
     gather_data_from_all_ranks,
 )
-from torchdiff.distributed.fsdp2_wrapper import FSDP2_mix_wrapper
-from torchdiff.distributed.fsdp_ema import FSDPEMAModel as EMAModel
-from torchdiff.distributed.cp_state import cp_state
+from ospnext.distributed.fsdp2_wrapper import FSDP2_mix_wrapper
+from ospnext.distributed.fsdp_ema import FSDPEMAModel as EMAModel
+from ospnext.distributed.cp_state import cp_state
 
-from torchdiff.modules import (
+from ospnext.modules import (
     WanVAE,
     T5EncoderModel,
     models,
@@ -44,13 +44,13 @@ from torchdiff.modules import (
     models_blocks_to_float,
     models_blocks_to_output_float,
 )
-from torchdiff.schedulers import schedulers
+from ospnext.schedulers import schedulers
 
-from torchdiff.distributed.checkpoint import Checkpointer, PREFIX as checkpoint_prefix
-from torchdiff.utils.constant import PROMPT, PROMPT_IDS, PROMPT_MASK
-from torchdiff.utils.utils import str_to_precision, params_nums_to_str, get_memory_allocated
-from torchdiff.utils.clip_grads import AdaptiveGradClipper
-from torchdiff.data.utils.wan_utils import WanTextProcessor
+from ospnext.distributed.checkpoint import Checkpointer, PREFIX as checkpoint_prefix
+from ospnext.utils.constant import PROMPT, PROMPT_IDS, PROMPT_MASK
+from ospnext.utils.utils import str_to_precision, params_nums_to_str, get_memory_allocated
+from ospnext.utils.clip_grads import AdaptiveGradClipper
+from ospnext.data.utils.wan_utils import WanTextProcessor
 from transformers import AutoTokenizer
 
 from peft import LoraConfig, get_peft_model, PeftModel
@@ -1009,8 +1009,8 @@ def main(config):
     set_seed(seed, device_specific=True, process_group=dp_group, deterministic=deterministic_training)
 
     log_on_main_process(logger, f"Initializing reward functions with config: {reward_fn_config}")
-    import torchdiff.rewards.rewards
-    reward_fn = getattr(torchdiff.rewards.rewards, 'multi_score')(device, reward_fn_config)
+    import ospnext.rewards.rewards
+    reward_fn = getattr(ospnext.rewards.rewards, 'multi_score')(device, reward_fn_config)
     dist.barrier()
     log_on_main_process(logger, "All ranks passed reward initialization.")
 
@@ -1082,7 +1082,7 @@ def main(config):
     stat_tracker = PerPromptStatTracker(global_std=global_std) if per_prompt_stat_tracking else None
 
     log_on_main_process(logger, "Computing negative text embedding...")
-    from torchdiff.utils.constant import NEGATIVE_PROMPT
+    from ospnext.utils.constant import NEGATIVE_PROMPT
     neg_text_processor = WanTextProcessor(
         tokenizer=AutoTokenizer.from_pretrained(text_tokenizer_path),
         model_max_length=text_max_length,
