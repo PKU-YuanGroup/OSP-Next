@@ -2,6 +2,7 @@ import os
 import sys
 import math
 import yaml
+import time
 import json
 import random
 import tempfile
@@ -14,7 +15,7 @@ from argparse import ArgumentParser
 import wandb
 import imageio
 
-from ospnext.utils.utils import check_and_import_npu
+from ospnext.utils.utils import check_and_import_npu, is_npu_available
 import torch
 check_and_import_npu()
 
@@ -30,11 +31,13 @@ from ospnext.utils.random_utils import set_seed
 from ospnext.distributed.utils import (
     setup_distributed_env,
     cleanup_distributed_env,
+    set_modules_to_forward_prefetch,
+    set_modules_to_backward_prefetch,
     gather_data_from_all_ranks,
 )
 from ospnext.distributed.fsdp2_wrapper import FSDP2_mix_wrapper
 from ospnext.distributed.fsdp_ema import FSDPEMAModel as EMAModel
-from ospnext.distributed.cp_state import cp_state
+from ospnext.distributed.sp_state import sp_state
 
 from ospnext.modules import (
     WanVAE,
@@ -70,9 +73,9 @@ def sde_step_with_logprob(
     num_inference_steps,
     prev_sample=None,
     generator=None,
-    deterministic=False,
+    determistic=False,
     return_dt_and_std_dev_t=False,
-    cp_group=None,
+    sp_group=None,
 ):
     model_output = model_output.float()
     sample = sample.float()
@@ -106,13 +109,13 @@ def sde_step_with_logprob(
                 device=model_output.device,
                 dtype=model_output.dtype,
             )
-            if cp_group is not None:
-                torch.distributed.broadcast(variance_noise, src=dist.get_global_rank(cp_group, 0), group=cp_group)
+            if sp_group is not None:
+                torch.distributed.broadcast(variance_noise, src=dist.get_global_rank(sp_group, 0), group=sp_group)
             prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1 * dt_b) * variance_noise
         else:
             prev_sample = prev_sample_mean
 
-    if deterministic:
+    if determistic:
         prev_sample = sample + dt_b * model_output
 
     log_prob = (
@@ -140,9 +143,9 @@ def osp_sample_with_logprob(
     guidance_scale=5.0,
     negative_text_embeddings=None,
     start_frame_latents=None,
-    deterministic=False,
+    determistic=False,
     kl_reward=0.0,
-    cp_group=None,
+    sp_group=None,
     sde_steps=None,
 ):
     if sde_steps is None:
@@ -152,8 +155,8 @@ def osp_sample_with_logprob(
 
     latents = torch.randn(latent_shape, device=device, dtype=torch.float32)
 
-    if cp_group is not None:
-        torch.distributed.broadcast(latents, src=dist.get_global_rank(cp_group, 0), group=cp_group)
+    if sp_group is not None:
+        torch.distributed.broadcast(latents, src=dist.get_global_rank(sp_group, 0), group=sp_group)
 
     sigmas = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
     if hasattr(scheduler, 'shift') and scheduler.shift != 1.0:
@@ -205,8 +208,8 @@ def osp_sample_with_logprob(
                 i,
                 latents.float(),
                 num_inference_steps,
-                deterministic=False,
-                cp_group=cp_group,
+                determistic=False,
+                sp_group=sp_group,
             )
         else:
             latents, log_prob, prev_latents_mean, std_dev_t = sde_step_with_logprob(
@@ -215,8 +218,8 @@ def osp_sample_with_logprob(
                 i,
                 latents.float(),
                 num_inference_steps,
-                deterministic=True,
-                cp_group=cp_group,
+                determistic=True,
+                sp_group=sp_group,
             )
         del noise_pred, latents_input
 
@@ -224,7 +227,7 @@ def osp_sample_with_logprob(
             all_latents.append(latents)
             all_log_probs.append(log_prob)
 
-        if is_sde_step and kl_reward > 0 and not deterministic:
+        if is_sde_step and kl_reward > 0 and not determistic:
             with model.disable_adapter():
                 with torch.autocast("cuda", dtype=weight_dtype):
                     ref_noise_pred = model(
@@ -253,7 +256,7 @@ def osp_sample_with_logprob(
                 latents_ori.float(),
                 num_inference_steps,
                 prev_sample=latents.float(),
-                cp_group=cp_group,
+                sp_group=sp_group,
             )
             del ref_noise_pred
             kl = ((prev_latents_mean - ref_prev_latents_mean) ** 2 / (2 * std_dev_t ** 2))
@@ -343,8 +346,8 @@ def osp_sample_deterministic(
             i,
             latents.float(),
             num_inference_steps,
-            deterministic=True,
-            cp_group=None,
+            determistic=True,
+            sp_group=None,
         )
         del noise_pred, latents_input
 
@@ -373,7 +376,7 @@ def compute_log_prob_for_training(
     guidance_scale=1.0,
     negative_text_embeddings=None,
     start_frame_latents=None,
-    cp_group=None,
+    sp_group=None,
 ):
     do_cfg = guidance_scale > 1.0
     latents_input = sample["latents"][:, step_idx].to(weight_dtype)
@@ -409,7 +412,7 @@ def compute_log_prob_for_training(
         num_inference_steps,
         prev_sample=sample["next_latents"][:, step_idx].float(),
         return_dt_and_std_dev_t=True,
-        cp_group=cp_group,
+        sp_group=sp_group,
     )
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t, dt
@@ -614,8 +617,8 @@ def main(config):
     scheduler_config = config.get("scheduler_config", {})
     # skiparse 相关
     sparse_ratio = model_config.get("sparse_ratio", 1)
-    skiparse_1d = model_config.get("skiparse_1d", False)
-    skiparse_2d = model_config.get("skiparse_2d", False)
+    skiparse_model_type = model_config.get("skiparse_model_type", "full")
+    is_skiparse_model = skiparse_model_type != "full"
     num_full_blocks = model_config.get("num_full_blocks", 0)
 
     # LoRA config
@@ -639,7 +642,7 @@ def main(config):
     num_image_per_prompt = rl_config.get("num_image_per_prompt", 4)
     sample_time_per_prompt = rl_config.get("sample_time_per_prompt", 1)
     timestep_fraction = rl_config.get("timestep_fraction", 1.0)
-    clip_range = rl_config.get("clip_range", 1e-4)
+    clip_range = rl_config.get("clip_range", 5e-3)
     adv_clip_max = rl_config.get("adv_clip_max", 5.0)
     kl_reward = rl_config.get("kl_reward", 0.0)
     kl_beta = rl_config.get("kl_beta", 0.0)
@@ -680,8 +683,8 @@ def main(config):
     reshard_after_forward = config.get("reshard_after_forward", None)
     model_cpu_offload = config.get("model_cpu_offload", False)
     encoder_cpu_offload = config.get("encoder_cpu_offload", False)
-    use_context_parallel = config.get("use_context_parallel", False)
-    use_skiparse_context_parallel = config.get("use_skiparse_context_parallel", False)
+    use_sequence_parallel = config.get("use_sequence_parallel", False)
+    use_skiparse_sequence_parallel = config.get("use_skiparse_sequence_parallel", False)
     deterministic_training = config.get("deterministic_training", False)
 
     # save config
@@ -718,33 +721,32 @@ def main(config):
     logger.info(f"rank {rank} use ddp mesh {ddp_fsdp_mesh['ddp']} and fsdp mesh {ddp_fsdp_mesh['fsdp']}")
 
     dp_group = dist.group.WORLD
-    cp_size = 1
-    use_context_parallel = use_context_parallel and config.get("cp_size", 1) > 1
-    skiparse_cp_size = 1
-    use_skiparse_context_parallel = use_skiparse_context_parallel and config.get("skiparse_cp_size", 1) > 1 and sparse_ratio > 1
-    use_global_context_parallel = use_context_parallel or use_skiparse_context_parallel
-    global_cp_size = 1
-    full_cp_size = 1
-    use_full_blocks_context_parallel = use_global_context_parallel and (skiparse_1d or skiparse_2d) and num_full_blocks > 0
-    global_cp_group = None
+    sp_size = 1
+    use_sequence_parallel = use_sequence_parallel and config.get("sp_size", 1) > 1
+    skiparse_sp_size = 1
+    use_skiparse_sequence_parallel = use_skiparse_sequence_parallel and config.get("skiparse_sp_size", 1) > 1 and sparse_ratio > 1
+    use_global_sequence_parallel = use_sequence_parallel or use_skiparse_sequence_parallel
+    global_sp_size = 1
+    full_sp_size = 1
+    use_full_blocks_sequence_parallel = use_global_sequence_parallel and is_skiparse_model and num_full_blocks > 0
+    global_sp_group = None
 
-    if use_global_context_parallel:
-        if use_context_parallel:
-            cp_size = config.get("cp_size", 1)
-        if use_skiparse_context_parallel:
-            skiparse_cp_size = config.get("skiparse_cp_size", 1)
-            if skiparse_1d:
-                assert skiparse_cp_size <= sparse_ratio and sparse_ratio % skiparse_cp_size == 0
-            elif skiparse_2d:
-                assert skiparse_cp_size <= sparse_ratio ** 2 and (sparse_ratio ** 2) % skiparse_cp_size == 0
-        global_cp_size = skiparse_cp_size * cp_size
-        dp_global_cp_mesh = init_device_mesh("cuda", (world_size // global_cp_size, skiparse_cp_size, cp_size), mesh_dim_names=("dp", "skiparse_cp", "cp"))
-        dp_group = dp_global_cp_mesh["dp"].get_group()
-        global_cp_group = dp_global_cp_mesh["skiparse_cp", "cp"]._flatten().get_group()
-        skiparse_cp_group = dp_global_cp_mesh["skiparse_cp"].get_group()
-        full_cp_group = cp_group = dp_global_cp_mesh["cp"].get_group()
-        log_on_main_process(logger, f"Using context parallel: global_cp_size={global_cp_size}, cp_size={cp_size}, skiparse_cp_size={skiparse_cp_size}")
-        cp_state.reset(global_cp_group=global_cp_group, cp_group=cp_group, skiparse_cp_group=skiparse_cp_group, full_cp_group=full_cp_group)
+    if use_global_sequence_parallel:
+        if use_sequence_parallel:
+            sp_size = config.get("sp_size", 1)
+        if use_skiparse_sequence_parallel:
+            skiparse_sp_size = config.get("skiparse_sp_size", 1)
+            if is_skiparse_model:
+                # OSP-Next skiparse is 2D, so the per-rank shard must evenly divide sparse_ratio ** 2.
+                assert skiparse_sp_size <= sparse_ratio ** 2 and (sparse_ratio ** 2) % skiparse_sp_size == 0
+        global_sp_size = skiparse_sp_size * sp_size
+        dp_global_sp_mesh = init_device_mesh("cuda", (world_size // global_sp_size, skiparse_sp_size, sp_size), mesh_dim_names=("dp", "skiparse_sp", "sp"))
+        dp_group = dp_global_sp_mesh["dp"].get_group()
+        global_sp_group = dp_global_sp_mesh["skiparse_sp", "sp"]._flatten().get_group()
+        skiparse_sp_group = dp_global_sp_mesh["skiparse_sp"].get_group()
+        full_sp_group = sp_group = dp_global_sp_mesh["sp"].get_group()
+        log_on_main_process(logger, f"Using Sequence parallel: global_sp_size={global_sp_size}, sp_size={sp_size}, skiparse_sp_size={skiparse_sp_size}")
+        sp_state.reset(global_sp_group=global_sp_group, sp_group=sp_group, skiparse_sp_group=skiparse_sp_group, full_sp_group=full_sp_group)
 
     if rank == 0:
         os.makedirs(output_dir, exist_ok=True)
@@ -816,18 +818,18 @@ def main(config):
         with torch.device("meta"):
             model = models[model_name](**model_config)
 
-    if use_context_parallel or use_full_blocks_context_parallel:
-        if use_context_parallel and model.num_heads % cp_size != 0:
-            raise ValueError(f"When using context parallel, num_heads {model.num_heads} must be multiple of cp_size {cp_size}!")
-        if use_full_blocks_context_parallel:
-            if global_cp_size <= model.num_heads and model.num_heads % global_cp_size == 0:
-                full_cp_size = global_cp_size
+    if use_sequence_parallel or use_full_blocks_sequence_parallel:
+        if use_sequence_parallel and model.num_heads % sp_size != 0:
+            raise ValueError(f"When using Sequence parallel, num_heads {model.num_heads} must be multiple of sp_size {sp_size}!")
+        if use_full_blocks_sequence_parallel:
+            if global_sp_size <= model.num_heads and model.num_heads % global_sp_size == 0:
+                full_sp_size = global_sp_size
             else:
-                gcd = math.gcd(model.num_heads, global_cp_size)
-                full_cp_size = gcd
-            dummy_mesh = init_device_mesh("cuda", (world_size // full_cp_size, full_cp_size), mesh_dim_names=("dummy", "full_cp"))
-            full_cp_group = dummy_mesh["full_cp"].get_group()
-            cp_state.reset(full_cp_group=full_cp_group)
+                gcd = math.gcd(model.num_heads, global_sp_size)
+                full_sp_size = gcd
+            dummy_mesh = init_device_mesh("cuda", (world_size // full_sp_size, full_sp_size), mesh_dim_names=("dummy", "full_sp"))
+            full_sp_group = dummy_mesh["full_sp"].get_group()
+            sp_state.reset(full_sp_group=full_sp_group)
 
     if lora_path:
         log_on_main_process(logger, f"Loading existing LoRA from {lora_path}")
@@ -889,7 +891,7 @@ def main(config):
     if (kl_reward > 0 or kl_beta > 0) and hasattr(model, 'disable_adapter'):
         try:
             with model.disable_adapter():
-                log_on_main_process(logger, "disable_adapter() context manager works under FSDP2.")
+                log_on_main_process(logger, "disable_adapter() Sequence manager works under FSDP2.")
         except Exception as e:
             log_on_main_process(logger, f"WARNING: disable_adapter() failed under FSDP2: {e}")
             log_on_main_process(logger, "KL computation may not work correctly. Consider using a separate ref_model.")
@@ -1027,8 +1029,8 @@ def main(config):
         text_max_length=text_max_length,
     )
 
-    dp_size = dp_group.size() if use_global_context_parallel else world_size
-    dp_rank = dist.get_rank(dp_group) if use_global_context_parallel else rank
+    dp_size = dp_group.size() if use_global_sequence_parallel else world_size
+    dp_rank = dist.get_rank(dp_group) if use_global_sequence_parallel else rank
 
     train_sampler = DistributedKRepeatSampler(
         dataset=train_dataset,
@@ -1143,12 +1145,12 @@ def main(config):
     DDP size: {ddp_size}
     World size: {world_size}
     dp_size: {dp_size}
-    cp_size: {cp_size}
-    skiparse_cp_size: {skiparse_cp_size}
-    global_cp_size: {global_cp_size}
-    Use Context Parallel: {use_context_parallel}
-    Use Skiparse Context Parallel: {use_skiparse_context_parallel}
-    Use Full Blocks Context Parallel: {use_full_blocks_context_parallel}
+    sp_size: {sp_size}
+    skiparse_sp_size: {skiparse_sp_size}
+    global_sp_size: {global_sp_size}
+    Use Sequence Parallel: {use_sequence_parallel}
+    Use Skiparse Sequence Parallel: {use_skiparse_sequence_parallel}
+    Use Full Blocks Sequence Parallel: {use_full_blocks_sequence_parallel}
     Reshard after forward: {reshard_after_forward}
     Model CPU offload: {model_cpu_offload}
     Video: {video_num_frames}f x {video_height}h x {video_width}w
@@ -1229,9 +1231,9 @@ def main(config):
                         guidance_scale=guidance_scale,
                         negative_text_embeddings=neg_text_embeddings.expand(sample_batch_size, -1, -1),
                         start_frame_latents=None,
-                        deterministic=False,
+                        determistic=False,
                         kl_reward=kl_reward,
-                        cp_group=global_cp_group,
+                        sp_group=global_sp_group,
                         sde_steps=sde_steps,
                     )
 
@@ -1316,10 +1318,10 @@ def main(config):
         gathered_rewards = {}
         for key, value in samples["rewards"].items():
             if value.dim() == 1:
-                gathered = gather_data_from_all_ranks(value.unsqueeze(0), dim=0, group=dp_group if use_global_context_parallel else None)
+                gathered = gather_data_from_all_ranks(value.unsqueeze(0), dim=0, group=dp_group if use_global_sequence_parallel else None)
                 gathered_rewards[key] = gathered.reshape(-1).cpu().numpy()
             else:
-                gathered = gather_data_from_all_ranks(value, dim=0, group=dp_group if use_global_context_parallel else None)
+                gathered = gather_data_from_all_ranks(value, dim=0, group=dp_group if use_global_sequence_parallel else None)
                 gathered_rewards[key] = gathered.reshape(-1, *value.shape[1:]).cpu().numpy()
 
         if rank == 0:
@@ -1343,7 +1345,7 @@ def main(config):
 
         if per_prompt_stat_tracking and stat_tracker is not None:
             gathered_prompts_list = [None] * dp_size
-            if use_global_context_parallel:
+            if use_global_sequence_parallel:
                 dist.all_gather_object(gathered_prompts_list, all_prompts, group=dp_group)
             else:
                 dist.all_gather_object(gathered_prompts_list, all_prompts)
@@ -1420,8 +1422,8 @@ def main(config):
                 model.set_reshard_after_forward(reshard_after_forward, recurse=True)
 
             perm = torch.randperm(total_batch_size_local, device=device)
-            if use_global_context_parallel:
-                torch.distributed.broadcast(perm, src=dist.get_global_rank(global_cp_group, 0), group=global_cp_group)
+            if use_global_sequence_parallel:
+                torch.distributed.broadcast(perm, group_src=0, group=global_sp_group)
             perm = perm.cpu()
 
             samples = {
@@ -1469,7 +1471,7 @@ def main(config):
                             guidance_scale=guidance_scale if use_cfg_in_train else 1.0,
                             negative_text_embeddings=neg_embeds,
                             start_frame_latents=None,
-                            cp_group=global_cp_group,
+                            sp_group=global_sp_group,
                         )
 
                         if kl_beta > 0:
@@ -1486,7 +1488,7 @@ def main(config):
                                         guidance_scale=guidance_scale if use_cfg_in_train else 1.0,
                                         negative_text_embeddings=neg_embeds,
                                         start_frame_latents=None,
-                                        cp_group=global_cp_group,
+                                        sp_group=global_sp_group,
                                     )
 
                     if micro_batch["advantages"].dim() > 1:
@@ -1500,7 +1502,7 @@ def main(config):
                     policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
                     if kl_beta > 0:
-                        kl_loss = ((prev_sample_mean - ref_prev_sample_mean) ** 2).mean(dim=(1, 2, 3, 4)) / (2 * (std_dev_t * dt) ** 2).squeeze()
+                        kl_loss = ((prev_sample_mean - ref_prev_sample_mean) ** 2).mean(dim=(1, 2, 3, 4)) / (2 * (std_dev_t * ref_dt) ** 2).squeeze()
                         kl_loss = torch.mean(kl_loss)
                         loss = policy_loss + kl_beta * kl_loss
                         info["kl_loss"].append(kl_loss.detach())
