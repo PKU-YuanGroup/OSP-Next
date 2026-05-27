@@ -1,0 +1,91 @@
+# test yaml
+
+model_name: "osp_next"
+seed: 1024
+
+output_dir: "/path/to/output"
+
+training_iteration: 1000000
+# ddp_size: 1
+fsdp_size: 32
+sp_size: 4
+skiparse_sp_size: 4
+use_sequence_parallel: False
+use_skiparse_sequence_parallel: True
+reshard_after_forward: Null
+explicit_prefetching_num_blocks: 2
+gradient_checkpointing: True
+gradient_accumulation_steps: 1
+init_max_grad_norm: 1.0
+log_interval: 1
+save_interval: 500
+weight_dtype: "bf16"
+ema_decay: 0.999 # 0.999 is used for the 14B model
+ema_update_interval: 1
+save_with_dcp_api: True
+# model_cpu_offload: True
+# encoder_cpu_offload: False
+profiling: False
+
+wandb_config:
+  project_name: "osp_next"
+  exp_name: "osp_next"
+
+model_config:
+  dim: 5120
+  ffn_dim: 13824
+  freq_dim: 256
+  in_dim: 16
+  num_heads: 40
+  num_layers: 40
+  out_dim: 16
+  text_len: 512
+  skiparse_model_type: "dual_end"
+  sparse_ratio: 2
+  num_full_blocks: 8
+  # HIF8 quantization settings
+  # Set quant to "hif8" to enable quantization simulation on Q/K/V/O and FFN linears.
+  # Set to null (or omit) to use plain nn.Linear.
+  quant: "hif8"
+  quant_attn: "hif8"
+  scale_max_forward: 15.0    # forward activation scale clamp (HIF8 max ≈ 15)
+  scale_max_backward: 224.0  # backward gradient scale clamp  (HIF8 max ≈ 224)
+  pretrained_model_dir_or_checkpoint: "/path/to/model"
+
+scheduler_config:
+  scheduler_name: "flow_matching"
+  use_dynamic_shifting: True
+  use_logitnorm_time_sampling: True
+
+vae_config:
+  vae_path: "/path/to/vae"
+  dtype: "fp16"
+
+text_encoder_config:
+  text_len: 512
+  checkpoint_path: "/path/to/text_encoder"
+  use_fsdp: True
+
+data_config:
+  batch_size: 1
+  num_workers: 16
+  pin_memory: False
+  drop_last: True
+  shuffle: True
+  dataset_name: "wan_t2v"
+  dataset_config:
+    metafile_or_dir_path: "/path/to/train/dataset"
+    text_tokenizer_path: "/path/to/text_tokenizer"
+    text_drop_ratio: 0.1
+    sample_height: 720
+    sample_width: 1280
+    sample_num_frames: 81
+    train_fps: 16
+    tokenizer_max_length: 512
+    return_prompt_mask: True
+  sampler_name: "stateful_distributed"
+  collator_name: "wan_t2v"
+  
+optimizer_config:
+  lr: 0.00002 # 2e-5
+  weight_decay: 0.001 # 1e-3

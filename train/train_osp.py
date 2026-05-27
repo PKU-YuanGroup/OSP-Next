@@ -1,0 +1,561 @@
+import os
+import sys
+import math
+import yaml
+from tqdm import tqdm
+import wandb
+from copy import deepcopy
+
+from ospnext.utils.utils import check_and_import_npu, is_npu_available
+import torch
+check_and_import_npu()
+
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor
+from argparse import ArgumentParser
+
+from torch.utils.data import DataLoader
+from torchdata.stateful_dataloader import StatefulDataLoader
+
+from ospnext.data import ospnext_datasets, ospnext_samplers, ospnext_collators
+from ospnext.data.utils.utils import cyclic_iter
+from ospnext.utils.log_utils import get_logger, log_on_main_process, verify_min_gpu_count
+from ospnext.utils.random_utils import set_seed
+from ospnext.distributed.utils import (
+    setup_distributed_env, 
+    cleanup_distributed_env, 
+    set_modules_to_forward_prefetch, 
+    set_modules_to_backward_prefetch, 
+    gather_data_from_all_ranks
+)
+from ospnext.distributed.fsdp2_wrapper import FSDP2_mix_wrapper
+from ospnext.distributed.fsdp_ema import FSDPEMAModel as EMAModel
+from ospnext.distributed.sp_state import sp_state
+
+from ospnext.modules import (
+    WanVAE, 
+    T5EncoderModel, 
+    models, 
+    models_main_block, 
+    models_blocks_to_float,
+    models_blocks_to_output_float,
+)
+from ospnext.schedulers import schedulers
+
+from ospnext.distributed.checkpoint import Checkpointer, PREFIX as checkpoint_prefix
+from ospnext.utils.constant import VIDEO, PROMPT_IDS, PROMPT_MASK
+from ospnext.utils.utils import str_to_precision, params_nums_to_str, get_memory_allocated
+from ospnext.utils.clip_grads import AdaptiveGradClipper
+from ospnext.utils.encoder_cache import EncoderCacheManager
+
+def main(config):
+    logger = get_logger()
+
+    # config analysis
+    seed = config.get("seed", 42)
+
+    # model config
+    model_name = config.get("model_name", "osp_next")
+    task = config.get("task", "t2v")
+    model_config = config.get("model_config", {})
+    vae_config = config.get("vae_config", {})
+    text_encoder_config = config.get("text_encoder_config", {})
+    scheduler_config = config.get("scheduler_config", {})
+    # skiparse related
+    sparse_ratio = model_config.get("sparse_ratio", 1)
+    skiparse_model_type = model_config.get("skiparse_model_type", "full")
+    is_skiparse_model = skiparse_model_type != "full"
+    num_full_blocks = model_config.get("num_full_blocks", 0)
+
+    # data config
+    data_config = config.get("data_config", {})
+
+    # optimizer config
+    optimizer_config = config.get("optimizer_config", {})
+
+    # training config
+    training_iteration = config.get("training_iteration", 1000000)
+    gradient_checkpointing = config.get("gradient_checkpointing", False)
+    gradient_accumulation_steps = config.get("gradient_accumulation_steps", 1)
+    init_max_grad_norm = config.get("init_max_grad_norm", 1.0)
+    log_interval = config.get("log_interval", 1)
+    save_interval = config.get("save_interval", 1000)
+    weight_dtype = config.get("weight_dtype", "bfloat16")
+    reshard_after_forward = config.get("reshard_after_forward", None)
+    model_cpu_offload = config.get("model_cpu_offload", False)
+    encoder_cpu_offload = config.get("encoder_cpu_offload", False)
+    ema_decay = config.get("ema_decay", 0.9999)
+    ema_update_interval = config.get("ema_update_interval", 1)
+    explicit_prefetching_num_blocks = config.get("explicit_prefetching_num_blocks", 0)
+    use_sequence_parallel = config.get("use_sequence_parallel", False)
+    use_skiparse_sequence_parallel = config.get("use_skiparse_sequence_parallel", False)
+    deterministic_training = config.get("deterministic_training", False)
+    profiling = config.get("profiling", False)
+
+    # save config
+    output_dir = config.get("output_dir", "./output")
+    save_with_dcp_api = config.get("save_with_dcp_api", False)
+
+    # distributed setup
+    setup_distributed_env()
+    verify_min_gpu_count()
+
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device = torch.device(f"cuda:{local_rank}")
+    weight_dtype = str_to_precision(weight_dtype)
+
+    # wandb config
+    wandb_config = config.get("wandb_config", {})
+    if wandb_config.get("project_name", None) is not None and rank == 0:
+        project_name = wandb_config.get("project_name")
+        wandb.init(
+            project=project_name,
+            name=wandb_config.get("exp_name", project_name),
+            config=config,
+            dir=output_dir
+        )
+
+    # init fsdp config
+    fsdp_size = config.get("fsdp_size", 8)
+    if fsdp_size > world_size: 
+        fsdp_size = world_size
+        log_on_main_process(logger, f"Warning, GPU nums are not enough! FSDP size reset to {fsdp_size}!")
+    elif world_size % fsdp_size != 0:
+        raise ValueError(f"world_size % fsdp_size != 0, fsdp error!")
+    ddp_size = config.get("ddp_size", world_size // fsdp_size)
+    ddp_fsdp_mesh = init_device_mesh("cuda", (ddp_size, fsdp_size), mesh_dim_names=("ddp", "fsdp"))
+    logger.info(f"rank {rank} use ddp mesh {ddp_fsdp_mesh['ddp']} and fsdp mesh {ddp_fsdp_mesh['fsdp']}")
+
+    dp_group = dist.group.WORLD # use default world group
+    # init sp mesh if use sequence parallel
+    sp_size = 1
+    use_sequence_parallel = use_sequence_parallel and config.get("sp_size", 1) > 1
+    # skiparse sp
+    skiparse_sp_size = 1
+    use_skiparse_sequence_parallel = use_skiparse_sequence_parallel and config.get("skiparse_sp_size", 1) > 1 and sparse_ratio > 1
+    use_global_sequence_parallel = use_sequence_parallel or use_skiparse_sequence_parallel
+    global_sp_size = 1
+    # full sp size
+    full_sp_size = 1
+    use_full_blocks_sequence_parallel = use_global_sequence_parallel and is_skiparse_model and num_full_blocks > 0
+    if use_global_sequence_parallel:
+        if use_sequence_parallel:
+            sp_size = config.get("sp_size", 1)
+        if use_skiparse_sequence_parallel:
+            skiparse_sp_size = config.get("skiparse_sp_size", 1)
+            if is_skiparse_model:
+                # OSP-Next skiparse is 2D, so the per-rank shard must evenly divide sparse_ratio ** 2.
+                assert skiparse_sp_size <= sparse_ratio ** 2 and (sparse_ratio ** 2) % skiparse_sp_size == 0
+        global_sp_size = skiparse_sp_size * sp_size
+        # dp * skiparse_sp * sp = world_size
+        dp_global_sp_mesh = init_device_mesh("cuda", (world_size // global_sp_size, skiparse_sp_size, sp_size), mesh_dim_names=("dp", "skiparse_sp", "sp"))
+        dp_group = dp_global_sp_mesh["dp"].get_group()
+        global_sp_group = dp_global_sp_mesh["skiparse_sp", "sp"]._flatten().get_group()
+        skiparse_sp_group = dp_global_sp_mesh["skiparse_sp"].get_group()
+        # when initializing, full_blocks_sp_group and sp_group are the same group
+        full_sp_group = sp_group = dp_global_sp_mesh["sp"].get_group()
+        log_on_main_process(logger, f"We use sequence parallel, global_sp_size: {global_sp_size}, sp_size: {sp_size}, skiparse_sp_size: {skiparse_sp_size}")
+        sp_state.reset(global_sp_group=global_sp_group, sp_group=sp_group, skiparse_sp_group=skiparse_sp_group, full_sp_group=full_sp_group)
+
+    print(f"use_global_sequence_parallel: {use_global_sequence_parallel}, use_sequence_parallel: {use_sequence_parallel}, use_skiparse_sequence_parallel: {use_skiparse_sequence_parallel}, use_full_blocks_sequence_parallel: {use_full_blocks_sequence_parallel}")
+
+    if (save_interval * gradient_accumulation_steps) % global_sp_size != 0:
+        raise ValueError(
+            f"""because we use sequence parallel and encoder cache,
+            save_interval * gradient_accumulation_steps ({save_interval} * {gradient_accumulation_steps} = {save_interval * gradient_accumulation_steps}) must be multiple of global_sp_size {global_sp_size}!
+            """
+        )
+
+    if rank == 0:
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "config.yaml"), "w") as f:
+            yaml.dump(config, f, indent=4)
+    
+    set_seed(seed, device_specific=False) # for init
+    # init model
+    log_on_main_process(logger, f"Initializing VAE model with dtype: {str_to_precision(vae_config.get('dtype', 'fp32'))} ...")
+    vae = WanVAE(
+        vae_pth=vae_config.get("vae_path", None),
+        dtype=str_to_precision(vae_config.get("dtype", "fp32")),
+        device=device # for vae, we do not use fsdp
+    )
+    log_on_main_process(logger, f"VAE model initialized, memory allocated: {get_memory_allocated()} GiB")
+
+
+    log_on_main_process(logger, f"Initializing text encoder model with dtype: {weight_dtype} ...")
+    # the number of shard ranks for text_encoder is 8 by default
+    text_encoder_device_mesh = None
+    if text_encoder_config.get("use_fsdp", False):
+        num_replicate = max(world_size // 8, 1)
+        num_shard = world_size // num_replicate
+        text_encoder_device_mesh = init_device_mesh("cuda", (num_replicate, num_shard), mesh_dim_names=("replicate", "shard"))
+    text_encoder = T5EncoderModel(
+        text_len=text_encoder_config.get("text_len", 512),
+        dtype=weight_dtype,
+        device=device, # when no fsdp, we init the text_encoder on device
+        checkpoint_path=text_encoder_config.get("checkpoint_path", None),
+        use_fsdp=text_encoder_config.get("use_fsdp", False), # when using fsdp, we shard the text encoder by ddp_fsdp mesh
+        device_mesh=text_encoder_device_mesh,
+    )
+    log_on_main_process(logger, f"Text encoder model initialized, memory allocated: {get_memory_allocated()} GiB")
+
+    text_encoder_use_fsdp = text_encoder_config.get("use_fsdp", False)
+    if encoder_cpu_offload:
+        log_on_main_process(logger, "Offloading VAE and text encoder to CPU to save GPU memory...")
+        vae.model.to("cpu")
+        if not text_encoder_use_fsdp:
+            text_encoder.model.to("cpu")
+        torch.cuda.empty_cache()
+        log_on_main_process(logger, f"After encoder CPU offload, memory allocated: {get_memory_allocated()} GiB")
+
+    log_on_main_process(logger, "Initializing diffusion model and scheduler...")
+
+    scheduler = schedulers[scheduler_config.get("scheduler_name", "flow_matching")](**scheduler_config)
+
+    pretrained_model_dir_or_checkpoint = model_config.get("pretrained_model_dir_or_checkpoint", None)
+    has_loaded_pretrained_model = False
+    if pretrained_model_dir_or_checkpoint is not None and os.path.isdir(pretrained_model_dir_or_checkpoint):
+        log_on_main_process(logger, f"Load model from pretrained_model_dir {pretrained_model_dir_or_checkpoint}")
+        model = models[model_name].from_pretrained(pretrained_model_dir_or_checkpoint)
+        has_loaded_pretrained_model = True
+        if model_cpu_offload:
+            log_on_main_process(logger, "Moving pretrained model to CPU for FSDP CPU offloading...")
+            model.to("cpu")
+    else:
+        log_on_main_process(logger, f"Init model from scratch")
+        with torch.device("meta"):
+            model = models[model_name](**model_config)
+
+    if use_sequence_parallel or use_full_blocks_sequence_parallel:
+        if use_sequence_parallel and model.num_heads % sp_size != 0:
+            raise ValueError(f"When using sequence parallel, num_heads {model.num_heads} mush be mutiple of sp_size {sp_size}!")
+        if use_full_blocks_sequence_parallel:
+            if global_sp_size <= model.num_heads and model.num_heads % global_sp_size == 0:
+                full_sp_size = global_sp_size
+            # find the greatest common divisor of model.num_heads and global_sp_size
+            else:
+                gcd = math.gcd(model.num_heads, global_sp_size)
+                full_sp_size = gcd
+            # full_sp_size is a divisor of global_sp_size, and global_sp_size is a divisor of world_size
+            # so full_sp_group is a subset of global_sp_group
+            dummy_mesh = init_device_mesh("cuda", (world_size // full_sp_size, full_sp_size), mesh_dim_names=("dummy", "full_sp"))
+            full_sp_group = dummy_mesh["full_sp"].get_group()
+            sp_state.reset(full_sp_group=full_sp_group)
+
+    model.train()
+
+    # wrap model with fsdp2 mix-precision wrapper
+    FSDP2_mix_wrapper(
+        model,
+        dp_mesh=ddp_fsdp_mesh,
+        weight_dtype=weight_dtype,
+        main_block_to_half=models_main_block[model_name],
+        blocks_to_float=models_blocks_to_float[model_name],
+        blocks_to_output_float=models_blocks_to_output_float[model_name],
+        reshard_after_forward=reshard_after_forward,
+        cpu_offload=model_cpu_offload,
+    )
+
+    if not has_loaded_pretrained_model:
+        init_device = "cpu" if model_cpu_offload else device
+        model.to_empty(device=init_device)
+        set_seed(seed, device_specific=False) # for init
+        model.reset_parameters() # we should call reset_parameters because we init model at meta device 
+
+    log_on_main_process(logger, f"Diffusion model initialized, memory allocated: {get_memory_allocated()} GiB")
+    if gradient_checkpointing:
+        log_on_main_process(logger, "Use gradient checkpointing to save memory")
+        model.set_gradient_checkpointing(True)
+
+    # FSDP EMA model
+    log_on_main_process(logger, "Initializing ema model...")
+    ema_model = EMAModel(model, decay=ema_decay, update_interval=ema_update_interval)
+    log_on_main_process(logger, f"EMA model initialized, memory allocated: {get_memory_allocated()} GiB")
+
+    if explicit_prefetching_num_blocks > 0:
+        set_modules_to_forward_prefetch(model.blocks, num_to_forward_prefetch=explicit_prefetching_num_blocks)
+        set_modules_to_backward_prefetch(model.blocks, num_to_backward_prefetch=explicit_prefetching_num_blocks)
+
+    checkpointer = Checkpointer(folder=output_dir, dcp_api=save_with_dcp_api)
+    if checkpointer.last_training_iteration is not None:
+        log_on_main_process(logger, "Loading model checkpoint...")
+        checkpointer.load_model(model)
+        log_on_main_process(logger, "Loading EMA model checkpoint...")
+        ema_model.store(model)
+        checkpointer.load_model(model, ema=True)
+        ema_model.model_copy_to_ema(model)
+        ema_model.restore(model)
+        has_loaded_pretrained_model = True
+    elif pretrained_model_dir_or_checkpoint is not None and os.path.isfile(pretrained_model_dir_or_checkpoint):
+        log_on_main_process(logger, f"Load model from pretrained_model_checkpoint {pretrained_model_dir_or_checkpoint}")
+        checkpointer.load_model_from_path(model, pretrained_model_dir_or_checkpoint)
+        log_on_main_process(logger, f"Load EMA model from pretrained_model_checkpoint {pretrained_model_dir_or_checkpoint}")
+        ema_model.model_copy_to_ema(model)
+        has_loaded_pretrained_model = True
+
+    if not has_loaded_pretrained_model:
+        log_on_main_process(logger, f"warning! now we train from scratch, please make sure pretrained_model_dir_or_checkpoint={pretrained_model_dir_or_checkpoint} is correct!")
+
+    log_on_main_process(logger, "Initializing and loading optimizer checkpoint...")
+    learning_rate = optimizer_config.get("lr", 1e-4)
+    weight_decay = optimizer_config.get("weight_decay", 1e-2)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        betas=optimizer_config.get("betas", (0.9, 0.999)),
+        weight_decay=weight_decay,
+        eps=optimizer_config.get("eps", 1e-15),
+    )
+    log_on_main_process(logger, "Initializing adaptive gradient clipping...")
+    adaptive_grad_clipper = AdaptiveGradClipper(init_max_grad_norm=init_max_grad_norm, model_parallel_group=ddp_fsdp_mesh["fsdp"].get_group())
+
+    if checkpointer.last_training_iteration is not None:
+        checkpointer.load_optim(model, optimizer)
+        adaptive_grad_clipper.load(output_dir=f"{output_dir}/{checkpoint_prefix}{checkpointer.last_training_iteration:09d}")
+
+    current_iteration = 0 if checkpointer.last_training_iteration is None else checkpointer.last_training_iteration
+    current_batch_nums = current_iteration * gradient_accumulation_steps
+
+    set_seed(seed, device_specific=True, process_group=dp_group, deterministic=deterministic_training) # for training
+    
+    log_on_main_process(logger, "Initializing dataset, sampler and dataloader...")
+    # dataset
+    dataset = ospnext_datasets[data_config.get("dataset_name", "t2v_random")](**data_config.get("dataset_config", {}))
+    
+    # sampler
+    batch_size = data_config.get("batch_size", 1)
+    dp_size = dp_group.size() 
+    sampler = ospnext_samplers[data_config.get("sampler_name", "stateful_distributed")](
+        dataset, 
+        num_replicas=dist.get_world_size(), # we use encoder cache, so num_replicas = world_size
+        rank=dist.get_rank(), # we use encoder cache, so rank in dp_group is same as global rank
+        shuffle=data_config.get("shuffle", True),
+        # consumed_samples=consumed_samples,
+        drop_last=data_config.get("drop_last", True),
+        seed=seed, # all ranks use the same seed to pass to sampler, sampler will first random the sequence with this seed, then split to ranks
+    )
+    # dataloader
+    num_workers = data_config.get("num_workers", 16)
+    collator = ospnext_collators[data_config.get("collator_name", "wan_t2v")](**data_config.get("collator_config", {}))
+    dataloader = StatefulDataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        collate_fn=collator,
+        num_workers=num_workers,
+        pin_memory=data_config.get("pin_memory", False),
+        generator=torch.Generator().manual_seed(seed + rank) # make sure all workers have different random patterns because we use encoder cache
+    )
+
+    if checkpointer.last_training_iteration is not None:
+        log_on_main_process(logger, "Loading dataloader state...")
+        checkpointer.load_dataloader_state_dict(dataloader)
+
+    encoder_cache_manager = EncoderCacheManager(tp_sp_group=global_sp_group if use_global_sequence_parallel else None)
+
+    trainable_params_before_sharding = trainable_params_after_sharding = 0
+    locked_params_before_sharding = locked_params_after_sharding = 0
+    for p in model.parameters():
+        if p.requires_grad:
+            trainable_params_before_sharding += p.numel()
+            if isinstance(p, DTensor):
+                trainable_params_after_sharding += p._local_tensor.numel()
+            else:
+                trainable_params_after_sharding += p.numel()
+        else:
+            locked_params_before_sharding += p.numel()
+            if isinstance(p, DTensor):
+                locked_params_after_sharding += p._local_tensor.numel()
+            else:
+                locked_params_after_sharding += p.numel()
+    start_training_logs = f"""
+    {'=' * 20}Start Training{'=' * 20}
+    Model: {model_name}
+    Model: {model}
+    Before FSDP sharding,
+    Model has {params_nums_to_str(trainable_params_before_sharding)} trainable parameters and {params_nums_to_str(locked_params_before_sharding)} locked parameters
+    After FSDP sharding,
+    Model has {params_nums_to_str(trainable_params_after_sharding)} trainable parameters and {params_nums_to_str(locked_params_after_sharding)} locked parameters
+    Scheduler: {scheduler_config.get("scheduler_name", "flow_matching")}
+    Dataset: {data_config.get("dataset_name", "t2v_random")}
+    Sampler: {data_config.get("sampler_name", "stateful_distributed")}
+    Collator: {data_config.get("collator_name", "wan_t2v")}
+    Use Encoder Cache Manager: {encoder_cache_manager.use_cache()}
+    Use Sequence Parallel: {use_sequence_parallel}
+    Use Skiparse Sequence Parallel: {use_skiparse_sequence_parallel}
+    Use Full Blocks Sequence Parallel: {use_full_blocks_sequence_parallel}
+    world_size: {world_size} GPUs
+    dp_size: {dp_size} GPUs
+    sp_size: {sp_size} GPUs
+    skiparse_sp_size: {skiparse_sp_size} GPUs
+    global_sp_size: {global_sp_size} GPUs
+    Gradient checkpointing: {gradient_checkpointing}
+    Weight dtype: {weight_dtype}
+    Reshard after forward: {reshard_after_forward}
+    Model CPU offload: {model_cpu_offload}
+    Encoder CPU offload: {encoder_cpu_offload}
+    EMA decay: {ema_decay} (update every {ema_update_interval} step)
+    Random seed: {seed}
+    Training iterations: {training_iteration}
+    Current iteration: {current_iteration}
+    Initial learning rate: {learning_rate}
+    Weight decay: {weight_decay}
+    Batch size per GPU: {batch_size}
+    Gradient accumulation steps: {gradient_accumulation_steps}
+    Effective batch size (dp_size x batch_size x gradient_accumulation_steps): {dp_size * batch_size * gradient_accumulation_steps}
+    Consumed samples (current_iteration * batch_size * gradient_accumulation_steps * dp_size): {current_iteration * batch_size * gradient_accumulation_steps * dp_size}
+    Save model to {output_dir} every {save_interval} iterations
+    Training ...
+    {'=' * 20}{'=' * len('Start Training')}{'=' * 20}
+    """
+    log_on_main_process(logger, start_training_logs)
+
+    tqdm_bar = tqdm(total=training_iteration, disable=(rank != 0), initial=current_iteration, desc="Training")
+    gathered_avg_loss = 0.0
+    dataloader_iter = iter(cyclic_iter(dataloader)) # when one epoch is finished, this func will call __iter__ in sampler to produce next iter with different seed
+    
+    if checkpointer.last_training_iteration is not None:
+        log_on_main_process(logger, "Loading rng state...")
+        checkpointer.load_rng_state_dict()
+
+    while current_iteration < training_iteration:
+        if current_batch_nums % global_sp_size == 0:
+            if encoder_cpu_offload:
+                vae.model.to(device)
+                if not text_encoder_use_fsdp:
+                    text_encoder.model.to(device)
+
+            batch = next(dataloader_iter)
+            video = batch.pop(VIDEO, None).to(dtype=torch.float32, device=device, non_blocking=True)
+            prompt_ids = batch.pop(PROMPT_IDS, None).to(device=device, non_blocking=True)
+            prompt_mask = batch.pop(PROMPT_MASK, None).to(device=device, non_blocking=True)
+            
+            with torch.no_grad():
+                latents = vae.encode(video)
+                text_embeddings = text_encoder(prompt_ids, prompt_mask)
+                vae_latents_list, text_embeds_list = encoder_cache_manager(
+                    vae_latents_list=[latents],
+                    text_embeds_list=[text_embeddings],
+                    step=current_batch_nums
+                )
+
+            if encoder_cpu_offload:
+                vae.model.to("cpu")
+                if not text_encoder_use_fsdp:
+                    text_encoder.model.to("cpu")
+                torch.cuda.empty_cache()
+        else:
+            vae_latents_list, text_embeds_list = encoder_cache_manager(step=current_batch_nums)
+        latents = vae_latents_list[0]
+        text_embeddings = text_embeds_list[0]
+
+        current_batch_nums += 1
+
+        q_sample_results = scheduler.q_sample(latents)
+        interpolated_latents = q_sample_results["x_t"].to(weight_dtype)
+        prior_dist = q_sample_results["prior_dist"]
+        sigmas = q_sample_results["sigmas"]
+        timesteps = q_sample_results["timesteps"]
+
+        if use_global_sequence_parallel:
+            torch.distributed.broadcast(interpolated_latents, group_src=0, group=global_sp_group)
+            torch.distributed.broadcast(prior_dist, group_src=0, group=global_sp_group)
+            torch.distributed.broadcast(sigmas, group_src=0, group=global_sp_group)
+            torch.distributed.broadcast(timesteps, group_src=0, group=global_sp_group)
+
+        with torch.autocast("cuda", dtype=weight_dtype):
+            if profiling and current_iteration >= 5:
+                if is_npu_available():
+                    import torch_npu
+                    prof = torch_npu.profiler.profile(
+                        activities=[torch_npu.profiler.ProfilerActivity.CPU, 
+                                torch_npu.profiler.ProfilerActivity.CUDA],
+                        with_stack=True, with_modules=True
+                    )
+                else:
+                    prof = torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CPU, 
+                                torch.profiler.ProfilerActivity.CUDA],
+                        with_stack=True, with_modules=True
+                    )
+                with prof:
+                    model_output = model(
+                        interpolated_latents,
+                        timesteps,
+                        text_embeddings,
+                    )
+                prof.export_chrome_trace(f"{output_dir}/trace_rank{rank}_{current_iteration:09d}.json")
+                if current_iteration > 6: sys.exit(0)
+            else:
+                model_output = model(
+                    interpolated_latents,
+                    timesteps,
+                    text_embeddings,
+                )
+
+        loss = scheduler.training_losses(model_output, latents, prior_dist)[0]
+        loss = loss / gradient_accumulation_steps # default value of gradient_accumulation_steps is 1
+        loss.backward()
+        loss_for_log = loss.clone().detach().unsqueeze(0)
+        gathered_loss = gather_data_from_all_ranks(loss_for_log, dim=0)
+        gathered_avg_loss += gathered_loss.mean().item()
+
+        if current_batch_nums % gradient_accumulation_steps == 0:
+            current_iteration += 1
+            grad_norm_after_clip = adaptive_grad_clipper.adaptive_clip(model.parameters())
+            # grad_norm_after_clip = torch.nn.utils.clip_grad_norm_(model.parameters(), init_max_grad_norm, foreach=False)
+            optimizer.step()
+            optimizer.zero_grad()
+            ema_model.update(model, current_iteration)
+
+            if current_iteration % log_interval == 0:
+                tqdm_bar.set_postfix({
+                    "loss": gathered_avg_loss,
+                    "lr": optimizer.param_groups[0]['lr'],
+                    "grad_norm": grad_norm_after_clip.item()
+                }, refresh=False)  # do not refresh immediately
+                tqdm_bar.update(log_interval)
+                if rank == 0 and wandb.run is not None:
+                    wandb_logs = {
+                        "train/loss": gathered_avg_loss,
+                        "train/lr": optimizer.param_groups[0]['lr'],
+                        "train/grad_norm": grad_norm_after_clip.item(),
+                    }
+                    wandb_logs.update(adaptive_grad_clipper.state_dict())
+                    wandb.log(wandb_logs, step=current_iteration)
+
+            if current_iteration % save_interval == 0 or current_iteration == training_iteration:
+                log_on_main_process(logger, f"Saving model checkpoint at iteration {current_iteration}...")
+                checkpointer.save(model, optimizer, dataloader, current_iteration)
+                ema_model.store(model)
+                ema_model.ema_copy_to_model(model)
+                checkpointer.save_ema_model(model, current_iteration)
+                ema_model.restore(model)
+                adaptive_grad_clipper.save(output_dir=f"{output_dir}/{checkpoint_prefix}{current_iteration:09d}")
+            
+            gathered_avg_loss = 0.0    
+
+    end_training_logs = f"""
+    {'=' * 20}End Training{'=' * 20}
+    training iteration: {current_iteration}
+    consumed samples: {current_batch_nums * batch_size}
+    Model saved to {output_dir}
+    Training finished.
+    {'=' * 20}{'=' * len('End Training')}{'=' * 20}
+    """
+    log_on_main_process(logger, end_training_logs)
+    cleanup_distributed_env()
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    parser.add_argument("--config", type=str, default="./configs/t2v.yaml")
+    args = parser.parse_args()
+    if not os.path.exists(args.config):
+        raise ValueError
+    with open(args.config, 'r') as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
+    main(config)

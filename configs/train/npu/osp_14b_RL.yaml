@@ -1,0 +1,106 @@
+model_name: "osp_next"
+seed: 42
+
+output_dir: "/path/to/output"
+
+num_epochs: 1000
+# ddp_size: 1
+fsdp_size: 16
+sp_size: 4
+skiparse_sp_size: 4
+use_sequence_parallel: False
+use_skiparse_sequence_parallel: True
+reshard_after_forward: Null
+explicit_prefetching_num_blocks: 0
+gradient_checkpointing: True
+gradient_accumulation_steps: 1
+init_max_grad_norm: 1.0
+log_interval: 1
+save_interval: 500
+weight_dtype: "bf16"
+ema_decay: 0.999 # 0.999 is used for the 14B model
+ema_update_interval: 1
+save_with_dcp_api: True
+model_cpu_offload: False
+encoder_cpu_offload: False
+profiling: False
+
+wandb_config:
+  project_name: "osp_next_RL"
+  exp_name: "osp_next_RL"
+
+model_config:
+  dim: 5120
+  ffn_dim: 13824
+  freq_dim: 256
+  in_dim: 16
+  num_heads: 40
+  num_layers: 40
+  out_dim: 16
+  text_len: 512
+  skiparse_model_type: "dual_end"
+  sparse_ratio: 2
+  num_full_blocks: 8
+  pretrained_model_dir_or_checkpoint: "/path/to/model"
+
+scheduler_config:
+  scheduler_name: "flow_matching"
+  use_dynamic_shifting: True
+  use_logitnorm_time_sampling: True
+
+vae_config:
+  vae_path: "/path/to/vae"
+  dtype: "fp16"
+
+text_encoder_config:
+  text_len: 512
+  checkpoint_path: "/path/to/text_encoder"
+  text_tokenizer_path: "/path/to/tokenizer"
+  use_fsdp: True
+
+# RL training uses a text-only prompt dataset, only the tokenizer is needed here.
+data_config:
+  dataset_config:
+    text_tokenizer_path: "/path/to/tokenizer"
+    tokenizer_max_length: 512
+
+optimizer_config:
+  lr: 0.00002 # 2e-5
+  weight_decay: 0.001 # 1e-3
+
+lora_config:
+  rank: 32
+  alpha: 64
+  target_modules:
+    - "self_attn.q"
+    - "self_attn.k"
+    - "self_attn.v"
+    - "self_attn.o"
+    - "cross_attn.q"
+    - "cross_attn.k"
+    - "cross_attn.v"
+    - "cross_attn.o"
+  # lora_path: "/path/to/existing/lora"  # set to resume from an existing LoRA checkpoint
+
+rl_config:
+  prompt_file: "/path/to/prompt_file"
+  eval_prompt_file: "/path/to/eval_prompt_file"
+  height: 720
+  width: 1280
+  num_frames: 81
+  sde_steps: 10
+  num_inference_steps: 25
+  guidance_scale: 5.0
+  kl_beta: 0.004
+  num_batches_per_epoch: 4
+  num_image_per_prompt: 4
+  sample_time_per_prompt: 1
+  sample_batch_size: 2
+  train_batch_size: 2
+  eval_num_steps: 50
+  eval_freq: 20
+  use_cfg_in_train: True
+  adv_clip_max: 5.0
+  clip_range: 1e-4
+  reward_fn:
+    videoalign: 1.0

@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ospnext"
+version = "1.0"
+description = "OSP-Next: video diffusion trainer and runner with sequence parallelism (FSDP2 / Ulysses / Skiparse SP)."
+license = { file = "LICENSE.txt" }
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "torchdata",
+    "accelerate>=1.4.0",
+    "diffusers>=0.31.0",
+    "transformers>=4.55.0",
+    "peft>=0.10.0",
+    "trl>=0.11.0",
+    "safetensors>=0.4.3",
+    "einops>=0.7.0",
+    "numpy>=1.23.5,<2",
+    "pandas>=2.0.0",
+    "Pillow>=10.0.0",
+    "imageio>=2.30.0",
+    "imageio-ffmpeg>=0.4.9",
+    "av>=11.0.0",
+    "decord>=0.6.0",
+    "ftfy>=6.1.0",
+    "regex>=2023.10.3",
+    "beautifulsoup4>=4.12.0",
+    "lmdb>=1.4.0",
+    "zstandard>=0.21.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+    "wandb>=0.16.0",
+    "packaging>=23.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+npu = [
+    "torch_npu==2.8.0.post2",
+]
+dev = [
+    "pytest",
+    "black",
+    "flake8",
+    "isort",
+    "mypy",
+    "huggingface-hub[cli]",
+]
+
+[tool.setuptools.packages.find]
+include = ["ospnext*"]
+exclude = ["ospnext.quant_cy_npu.base.cusrc*"]
+
+[tool.setuptools.package-data]
+"ospnext" = ["**/*.py"]
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"
+
+[tool.mypy]
+strict = true

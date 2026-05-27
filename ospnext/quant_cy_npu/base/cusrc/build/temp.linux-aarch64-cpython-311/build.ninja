@@ -1,0 +1,29 @@
+ninja_required_version = 1.3
+cxx = c++
+
+cflags = -pthread -B /home/ma-user/anaconda3/envs/PyTorch-2.5.1/compiler_compat -Wsign-compare -DNDEBUG -fwrapv -O3 -Wall -fPIC -O3 -isystem /home/ma-user/anaconda3/envs/PyTorch-2.5.1/include -fPIC -O3 -isystem /home/ma-user/anaconda3/envs/PyTorch-2.5.1/include -fPIC -I/home/ma-user/anaconda3/envs/PyTorch-2.5.1/lib/python3.11/site-packages/torch_npu/include -I/home/ma-user/anaconda3/envs/PyTorch-2.5.1/lib/python3.11/site-packages/torch/include -I/home/ma-user/anaconda3/envs/PyTorch-2.5.1/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -I/home/ma-user/anaconda3/envs/PyTorch-2.5.1/include/python3.11 -c
+post_cflags = -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1018"' -DTORCH_EXTENSION_NAME=npu_quant -std=c++17
+cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
+ldflags = 
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+
+
+
+
+
+
+build /home/ma-user/work/gyy/HiFloat8/hif8_npu/quant_cy_npu/base/cusrc/build/temp.linux-aarch64-cpython-311/npu_quant.o: compile /home/ma-user/work/gyy/HiFloat8/hif8_npu/quant_cy_npu/base/cusrc/npu_quant.cpp
+
+
+
+
+
+
+
+
