@@ -1216,25 +1216,25 @@ If you find OSP-Next useful in your research, please consider citing:
 Related work this project builds on:
 
 ```bibtex
-@article{wan2025,
-  title   = {Wan: Open and Advanced Large-Scale Video Generative Models},
-  author  = {Team Wan and Wang, Ang and Ai, Baole and others},
-  journal = {arXiv preprint arXiv:2503.20314},
-  year    = {2025},
+@article{wan2025wan,
+  title={Wan: Open and advanced large-scale video generative models},
+  author={Wan, Team and Wang, Ang and Ai, Baole and Wen, Bin and Mao, Chaojie and Xie, Chen-Wei and Chen, Di and Yu, Feiwu and Zhao, Haiming and Yang, Jianxiao and others},
+  journal={arXiv preprint arXiv:2503.20314},
+  year={2025}
 }
 
-@article{lin2024opensoraplan,
-  title   = {Open-Sora Plan: Open-Source Large Video Generation Model},
-  author  = {Lin, Bin and Ge, Yunyang and Cheng, Xinhua and others},
-  journal = {arXiv preprint arXiv:2412.00131},
-  year    = {2024},
+@article{lin2024open,
+  title={Open-sora plan: Open-source large video generation model},
+  author={Lin, Bin and Ge, Yunyang and Cheng, Xinhua and Li, Zongjian and Zhu, Bin and Wang, Shaodong and He, Xianyi and Ye, Yang and Yuan, Shenghai and Chen, Liuhan and others},
+  journal={arXiv preprint arXiv:2412.00131},
+  year={2024}
 }
 
 @article{li2025mixgrpo,
-  title   = {MixGRPO: Unlocking Flow-based GRPO Efficiency with Mixed ODE-SDE},
-  author  = {Li, Junzhe and Cui, Yutao and Huang, Tao and Ma, Yinping and Fan, Chun and Cheng, Yiming and Yang, Miles and Zhong, Zhao and Bo, Liefeng},
-  journal = {arXiv preprint arXiv:2507.21802},
-  year    = {2025},
+  title={Mixgrpo: Unlocking flow-based grpo efficiency with mixed ode-sde},
+  author={Li, Junzhe and Cui, Yutao and Huang, Tao and Ma, Yinping and Fan, Chun and Cheng, Yiming and Yang, Miles and Zhong, Zhao and Bo, Liefeng},
+  journal={arXiv preprint arXiv:2507.21802},
+  year={2025}
 }
 ```
 
