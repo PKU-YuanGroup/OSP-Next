@@ -2,8 +2,6 @@
 
 <img src="assets/logo.png" alt="OSP-Next" width="220">
 
-# OSP-Next
-
 ### Efficient High-Quality Video Generation with Sparse Sequence Parallelism, HiF8 Quantization, and Reinforcement Learning
 
 **Open-Sora Plan · Next Generation**
@@ -40,8 +38,8 @@ contributions — see the [paper](<ARXIV_URL>) for the full technical report.
 <table>
 <tr>
 <td width="50%" valign="top">
+<h3>🧩 &nbsp;Skiparse-2D Attention</h3>
 
-### 🧩 &nbsp;Skiparse-2D Attention
 A **fixed-rule sparse attention pattern** purpose-built for image / video
 modalities, applied independently along height and width. Better aligns with
 spatial locality than Skiparse-1D, **approaches the quality of 3D Full
@@ -50,8 +48,8 @@ no custom triton or CUDA needed.
 
 </td>
 <td width="50%" valign="top">
+<h3>🔗 &nbsp;Sparse Sequence Parallelism (SSP)</h3>
 
-### 🔗 &nbsp;Sparse Sequence Parallelism (SSP)
 A **parallel strategy natively co-designed with Skiparse-2D Attention**.
 Compared to Ulysses SP, SSP cuts **inter-rank communication volume by 75%** and
 drops the per-block communication steps **from 4 down to 1** — removing the SP
@@ -61,16 +59,16 @@ bottleneck for long-video, long-context training.
 </tr>
 <tr>
 <td width="50%" valign="top">
+<h3>🪶 &nbsp;HiF8 Quantization &nbsp;<sub>(NPU only)</sub></h3>
 
-### 🪶 &nbsp;HiF8 Quantization &nbsp;<sub>(NPU only)</sub>
 A **dynamic-precision HiF8** scheme (per-tensor exponent / mantissa allocation)
 applied on top of the sparse model. The **first work to show that 8-bit
 quantization and sparse-model fine-tuning can be done jointly** — the VBench gap stays within ~0.5% with baseline, and inference reaches up to **2.27× speed-up** on a single Ascend 950PR.
 
 </td>
 <td width="50%" valign="top">
+<h3>🎯 &nbsp;Mix-GRPO RL on Sparse Models</h3>
 
-### 🎯 &nbsp;Mix-GRPO RL on Sparse Models
 The **first attempt to apply reinforcement learning to a sparse video
 generation model**. Our **Mix-GRPO + LoRA** pipeline shows that RL keeps
 pushing the quality / preference frontier of sparse models — and the entire
@@ -182,10 +180,6 @@ bash scripts/infer/gpu/infer_osp_14b.sh
 A side-by-side comparison of the same prompt across three models. Hit ▶ on any
 cell to play the video right inside the page.
 
-> 📺  Videos are uploaded as GitHub asset URLs; placeholders below will be
-> swapped with real `https://github.com/user-attachments/assets/...` links
-> alongside the arXiv release.
-
 <!--
   TODO: replace each <DEMO_*> placeholder with a GitHub-hosted mp4 URL, e.g.
         https://github.com/user-attachments/assets/<uuid>
@@ -237,7 +231,7 @@ cell to play the video right inside the page.
 | Model             | Params | 🤗 HuggingFace                       | <img src="https://github.com/modelscope.png?size=48" height="14" alt="ModelScope" valign="middle"> ModelScope |
 |-------------------|-------:|--------------------------------------|----------------------------------------------------------------------|
 | OSP-Next 14B      |  14B   | [`yunyangge/OSP-Next`](https://huggingface.co/yunyangge/OSP-Next) | [`beihai123/OSP-Next`](https://modelscope.cn/models/beihai123/OSP-Next) |
-| OSP-Next-HiF8 14B |  14B   | [`<HF_HIF8_14B>`](<HF_URL_HIF8_14B>)  | [`<MS_HIF8_14B>`](<MS_URL_HIF8_14B>)  |
+| OSP-Next-HiF8 14B |  14B   | [`yunyangge/OSP-Next`](https://huggingface.co/yunyangge/OSP-Next)  | [`beihai123/OSP-Next`](https://modelscope.cn/models/beihai123/OSP-Next)  |
 
 > ℹ️  The `*_1_3b.yaml` configs and `*_1_3b.sh` launch scripts are kept in the
 > repository as ready-to-use templates if you want to train your own 1.3B
@@ -334,6 +328,7 @@ OSP-Next/
 │   └── train_osp_RL.py          # Entry: Mix-GRPO + LoRA RL training
 ├── infer/
 │   └── infer_osp.py             # Entry: text-to-video inference
+├── merge_lora_weights.py        # Merge RL LoRA into base for deployment
 ├── filter_data.py               # Entry: build LMDB from annotated video corpus
 ├── assets/
 │   ├── logo.png                 # README logo
@@ -684,8 +679,8 @@ For each batch of training videos, produce a JSON file describing each clip:
     "cap":  "A stylish woman walks down ...",  // 🔧 required — caption
     "resolution": {"height": 1080, "width": 1920},  // optional, auto-probed if absent
     "fps": 24,                                  // optional, auto-probed if absent
-    "num_frames": 49,                           // optional, auto-probed if absent
-    "cut": [0, 49]                              // optional — [start, end) frame
+    "num_frames": 81,                           // optional, auto-probed if absent
+    "cut": [0, 81]                              // optional — [start, end) frame
                                                 // indices when the JSON points
                                                 // to a sub-clip of a long video
   },
@@ -917,6 +912,8 @@ sp_size: 4
 skiparse_sp_size: 4
 use_sequence_parallel: False
 use_skiparse_sequence_parallel: True
+reshard_after_forward: Null
+explicit_prefetching_num_blocks: 0
 gradient_checkpointing: True
 gradient_accumulation_steps: 1
 init_max_grad_norm: 1.0
@@ -928,6 +925,7 @@ ema_update_interval: 1
 save_with_dcp_api: True
 model_cpu_offload: False
 encoder_cpu_offload: False
+profiling: False
 
 wandb_config:
   project_name: "osp_next_RL"
@@ -938,8 +936,12 @@ model_config:
   #   config — only the LoRA adapter is being trained, the base must match.
   dim: 5120
   ffn_dim: 13824
+  freq_dim: 256
+  in_dim: 16
   num_heads: 40
   num_layers: 40
+  out_dim: 16
+  text_len: 512
   skiparse_model_type: "dual_end"
   sparse_ratio: 2
   num_full_blocks: 8
@@ -991,12 +993,19 @@ rl_config:
   width:  1280
   num_frames: 81
   sde_steps: 10                          # # of steps trained with SDE noise
-  num_inference_steps: 25                # total denoising steps in sampling
+  num_inference_steps: 25                # total denoising steps in rollout sampling
+  guidance_scale: 5.0                    # CFG scale used during rollout sampling
   kl_beta: 0.004                         # KL penalty weight (set 0 to disable)
   num_batches_per_epoch: 4               # batches per RL epoch
   num_image_per_prompt: 4                # k repeats (Mix-GRPO group size)
+  sample_time_per_prompt: 1              # how many times each prompt is rolled out per epoch
   sample_batch_size: 2                   # batch size during rollout
   train_batch_size:  2                   # batch size during policy update
+  eval_num_steps: 50                     # denoising steps used in the eval pass
+  eval_freq: 20                          # run eval every N RL epochs
+  use_cfg_in_train: True                 # apply CFG in the policy update too
+  adv_clip_max: 5.0                      # max abs value for advantage clipping
+  clip_range: 1e-4                       # PPO-style ratio clip range
   reward_fn:
     videoalign: 1.0                      # 🔧 VideoAlign weight (1.0 → only reward used);
                                          #    set the actual checkpoint path through the
@@ -1018,18 +1027,82 @@ bash scripts/train/npu/train_osp_14b_RL.sh
 
 #### 📦 What gets saved during RL
 
+The RL trainer **only persists the LoRA adapter** — the base model is frozen,
+so we deliberately skip saving its weights to keep checkpoints small and
+deployable. Each save (`save_interval` epochs + a final save) produces:
+
 ```
 ${output_dir}/
-├── iteration_000000010/        # FSDP checkpoint (full state)
-├── iteration_000000010_ema/    # EMA model weights
-├── lora-checkpoint-10/         # LoRA-only weights (small, portable)
-│   ├── adapter_model.bin
-│   └── adapter_config.json
-└── rl_training_state.json      # epoch / global_step bookkeeping
+├── lora-checkpoint-10/                   # 🎯 current LoRA (deployable)
+│   ├── adapter_model.bin                 # LoRA matrices only
+│   ├── adapter_config.json               # PEFT LoRA config
+│   ├── adaptive_grad_clipper.pt          # grad-clipper EMA state (resume helper)
+│   └── rl_training_state.json            # epoch / global_step bookkeeping
+└── lora-checkpoint-10-ema/               # 🎯 EMA-averaged LoRA (recommended for inference)
+    ├── adapter_model.bin
+    └── adapter_config.json
 ```
 
-The `lora-checkpoint-*/` directories are the artifact you typically ship — load
-them back with `peft.PeftModel.from_pretrained(base_model, lora_path)`.
+> 💡 Use `lora-checkpoint-{step}-ema/` for inference (matches what's used during
+> in-training eval). Use the plain `lora-checkpoint-{step}/` if you want to
+> resume RL training — point `lora_config.lora_path` at it to pick up the LoRA
+> weights and the sidecar `rl_training_state.json` / grad-clipper state.
+
+#### 🔗 Step 3 — Merge LoRA back into the base model
+
+OSP-Next inference (`infer/infer_osp.py`) loads a **plain (merged) base model**,
+not a `PeftModel`. After RL training finishes, run `merge_lora_weights.py` to
+fold the LoRA delta into the frozen base weights and save a single
+deployment-ready checkpoint:
+
+```python
+# merge_lora_weights.py — edit the four paths at the bottom and run once.
+from ospnext.modules.osp_next import OSPNextModel
+from merge_lora_weights import load_lora_and_merge
+
+model_path = "/path/to/osp_next_base"                         # 🔧 same base used during RL
+lora_path  = "/path/to/output_dir/lora-checkpoint-1000-ema/adapter_model.bin"  # 🔧 prefer the -ema variant
+save_path  = "/path/to/merged_osp_next_rl"                    # 🔧 destination
+
+model = OSPNextModel.from_pretrained(model_path)
+model = load_lora_and_merge(
+    model=model,
+    lora_path=lora_path,
+    lora_rank=32,                  # must match lora_config.rank used in RL
+    lora_alpha=64,                 # must match lora_config.alpha used in RL
+    lora_target_modules=[
+        "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
+        "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
+    ],
+)
+model.save_pretrained(save_path)
+```
+
+Or just edit the four paths at the bottom of `merge_lora_weights.py` directly
+and run:
+
+```bash
+python merge_lora_weights.py
+```
+
+The script will (1) wrap the base with the same PEFT `LoraConfig`, (2) load
+the trained LoRA weights, (3) call `peft.merge_and_unload()` to fold LoRA into
+the base, and (4) `save_pretrained()` the merged model.
+
+#### 🎬 Step 4 — Run inference with the merged model
+
+Point your inference config's `pretrained_model_dir_or_checkpoint` at the
+merged directory and launch as usual:
+
+```yaml
+# configs/infer/{gpu,npu}/osp_14b.yaml
+model_config:
+  pretrained_model_dir_or_checkpoint: "/path/to/merged_osp_next_rl"   # 🔧
+```
+
+```bash
+bash scripts/infer/gpu/infer_osp_14b.sh           # or the NPU variant
+```
 
 ---
 

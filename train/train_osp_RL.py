@@ -49,7 +49,6 @@ from ospnext.modules import (
 )
 from ospnext.schedulers import schedulers
 
-from ospnext.distributed.checkpoint import Checkpointer, PREFIX as checkpoint_prefix
 from ospnext.utils.constant import PROMPT, PROMPT_IDS, PROMPT_MASK
 from ospnext.utils.utils import str_to_precision, params_nums_to_str, get_memory_allocated
 from ospnext.utils.clip_grads import AdaptiveGradClipper
@@ -537,8 +536,21 @@ def calculate_zero_std_ratio(prompts, gathered_rewards):
     return zero_std_count / len(prompt_std_devs)
 
 
-def save_lora_checkpoint(model, save_dir, global_step):
-    save_root = os.path.join(save_dir, f"lora-checkpoint-{global_step}")
+LORA_CHECKPOINT_PREFIX = "lora-checkpoint-"
+
+
+def _lora_checkpoint_dir(save_dir, global_step, suffix: str = ""):
+    return os.path.join(save_dir, f"{LORA_CHECKPOINT_PREFIX}{global_step}{suffix}")
+
+
+def save_lora_checkpoint(model, save_dir, global_step, suffix: str = ""):
+    """Save LoRA-only adapter weights.
+
+    Base model parameters are frozen during RL training, so we deliberately
+    skip persisting them — only the LoRA matrices (and adapter config) are
+    written out. Use ``suffix='-ema'`` to save the EMA-shadowed LoRA.
+    """
+    save_root = _lora_checkpoint_dir(save_dir, global_step, suffix)
     if dist.get_rank() == 0:
         os.makedirs(save_root, exist_ok=True)
     dist.barrier()
@@ -549,10 +561,10 @@ def save_lora_checkpoint(model, save_dir, global_step):
                 full_param = param.full_tensor()
             else:
                 full_param = param
-                
+
             if dist.get_rank() == 0:
                 lora_state_dict[name] = full_param.detach().clone().cpu()
-    
+
     if dist.get_rank() == 0 and lora_state_dict:
         torch.save(lora_state_dict, os.path.join(save_root, "adapter_model.bin"))
         if hasattr(model, 'peft_config'):
@@ -569,8 +581,8 @@ RL_TRAINING_STATE_FILE = "rl_training_state.json"
 
 
 def save_rl_training_state(save_dir, global_step, next_epoch):
-    """Persist RL resume metadata alongside each checkpoint."""
-    save_root = os.path.join(save_dir, f"{checkpoint_prefix}{global_step:09d}")
+    """Persist RL resume metadata next to the LoRA checkpoint."""
+    save_root = _lora_checkpoint_dir(save_dir, global_step)
     if dist.get_rank() == 0:
         os.makedirs(save_root, exist_ok=True)
         with open(os.path.join(save_root, RL_TRAINING_STATE_FILE), "w", encoding="ascii") as f:
@@ -585,13 +597,9 @@ def save_rl_training_state(save_dir, global_step, next_epoch):
     dist.barrier()
 
 
-def load_rl_training_state(save_dir, global_step):
+def load_rl_training_state(lora_dir):
     """Load RL resume metadata for epoch/global_step bookkeeping."""
-    state_path = os.path.join(
-        save_dir,
-        f"{checkpoint_prefix}{global_step:09d}",
-        RL_TRAINING_STATE_FILE,
-    )
+    state_path = os.path.join(lora_dir, RL_TRAINING_STATE_FILE)
     if not os.path.exists(state_path):
         return None
     with open(state_path, "r", encoding="ascii") as f:
@@ -914,16 +922,11 @@ def main(config):
     ema_model.update = _lora_only_ema_update
     log_on_main_process(logger, f"EMA model initialized (LoRA-only update, {len(_lora_ema_keys)} LoRA keys), memory: {get_memory_allocated()} GiB")
 
-    checkpointer = Checkpointer(folder=output_dir, dcp_api=save_with_dcp_api)
-    if checkpointer.last_training_iteration is not None:
-        log_on_main_process(logger, "Loading model checkpoint...")
-        checkpointer.load_model(model)
-        log_on_main_process(logger, "Loading EMA model checkpoint...")
-        ema_model.store(model)
-        checkpointer.load_model(model, ema=True)
-        ema_model.model_copy_to_ema(model)
-        ema_model.restore(model)
-        has_loaded_pretrained_model = True
+    # RL training only persists LoRA adapters (base model is frozen), so there is
+    # no full FSDP checkpoint to resume from. To resume, set `lora_config.lora_path`
+    # in the config to a previously saved `lora-checkpoint-{step}/` directory;
+    # the LoRA weights are loaded above via `PeftModel.from_pretrained`, and any
+    # sidecar metadata (epoch / grad clipper state) is restored below.
     if not has_loaded_pretrained_model:
         log_on_main_process(logger, f"Warning! Training from scratch, pretrained_model_dir_or_checkpoint={pretrained_model_dir_or_checkpoint}")
 
@@ -951,11 +954,18 @@ def main(config):
         model_parallel_group=ddp_fsdp_mesh["fsdp"].get_group(),
     )
 
-    if checkpointer.last_training_iteration is not None:
-        checkpointer.load_optim(model, optimizer)
-        adaptive_grad_clipper.load(
-            output_dir=f"{output_dir}/{checkpoint_prefix}{checkpointer.last_training_iteration:09d}"
-        )
+    # Restore adaptive grad clipper state and epoch/global_step bookkeeping from
+    # the LoRA checkpoint directory that `lora_path` points to (if any). Note:
+    # AdamW optimizer state is NOT persisted across runs anymore — Adam moments
+    # are small for LoRA and re-warm quickly, and skipping them lets us avoid
+    # touching the base model.
+    resume_global_step = 0
+    start_epoch = 0
+    rl_training_state = None
+    if lora_path is not None:
+        lora_state_dir = lora_path if os.path.isdir(lora_path) else os.path.dirname(lora_path)
+        adaptive_grad_clipper.load(output_dir=lora_state_dir)
+        rl_training_state = load_rl_training_state(lora_state_dir)
         override_lr = None
         if resume_lr is not None:
             override_lr = resume_lr
@@ -969,9 +979,8 @@ def main(config):
                 f"Resume LR override enabled, force optimizer lr to {override_lr}",
             )
 
-    resume_global_step = 0 if checkpointer.last_training_iteration is None else checkpointer.last_training_iteration
-    start_epoch = 0
-    if checkpointer.last_training_iteration is not None:
+    if rl_training_state is not None:
+        resume_global_step = int(rl_training_state.get("global_step", 0))
         if resume_epoch is not None:
             start_epoch = int(resume_epoch)
             log_on_main_process(
@@ -980,29 +989,13 @@ def main(config):
                 "Skipping auto epoch recovery from rl_training_state.json.",
             )
         else:
-            rl_training_state = load_rl_training_state(output_dir, resume_global_step)
-            if rl_training_state is not None:
-                start_epoch = int(rl_training_state.get("next_epoch", 0))
-                saved_global_step = int(rl_training_state.get("global_step", resume_global_step))
-                if saved_global_step != resume_global_step:
-                    log_on_main_process(
-                        logger,
-                        f"Warning! RL training state global_step={saved_global_step} "
-                        f"does not match checkpoint folder step={resume_global_step}. "
-                        f"Using checkpoint folder step.",
-                    )
-            else:
-                log_on_main_process(
-                    logger,
-                    "Warning! RL training state file not found for resume checkpoint. "
-                    "Falling back to start_epoch=0; epoch continuity cannot be guaranteed. "
-                    "Set config.resume_epoch to recover the expected epoch manually.",
-                )
+            start_epoch = int(rl_training_state.get("next_epoch", 0))
     elif resume_epoch is not None:
         start_epoch = int(resume_epoch)
         log_on_main_process(
             logger,
-            f"resume_epoch={start_epoch} is set but no checkpoint was found in output_dir. "
+            f"resume_epoch={start_epoch} is set but no rl_training_state.json was found "
+            f"alongside lora_path={lora_path}. "
             "Training will start from scratch with the specified epoch index.",
         )
 
@@ -1591,16 +1584,15 @@ def main(config):
         dist.barrier()
 
         if epoch > 0 and epoch % save_interval == 0:
-            log_on_main_process(logger, f"Saving checkpoint at epoch {epoch} (global_step {global_step})...")
-            checkpointer.save(model, optimizer, None, global_step)
-            ema_model.store(model)
-            ema_model.ema_copy_to_model(model)
-            checkpointer.save_ema_model(model, global_step)
-            ema_model.restore(model)
-            adaptive_grad_clipper.save(output_dir=f"{output_dir}/{checkpoint_prefix}{global_step:09d}")
-            save_rl_training_state(output_dir, global_step, epoch + 1)
+            log_on_main_process(logger, f"Saving LoRA checkpoint at epoch {epoch} (global_step {global_step})...")
             if hasattr(model, 'save_pretrained'):
                 save_lora_checkpoint(model, output_dir, global_step)
+                ema_model.store(model)
+                ema_model.ema_copy_to_model(model)
+                save_lora_checkpoint(model, output_dir, global_step, suffix="-ema")
+                ema_model.restore(model)
+            adaptive_grad_clipper.save(output_dir=_lora_checkpoint_dir(output_dir, global_step))
+            save_rl_training_state(output_dir, global_step, epoch + 1)
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
         last_completed_epoch = epoch
@@ -1702,16 +1694,15 @@ def main(config):
             log_on_main_process(logger, f"[Eval] Eval video generation done at global_step {global_step}.")
 
     completed_epochs = max(start_epoch, last_completed_epoch + 1)
-    log_on_main_process(logger, f"Saving final checkpoint at global_step {global_step}...")
-    checkpointer.save(model, optimizer, None, global_step)
-    ema_model.store(model)
-    ema_model.ema_copy_to_model(model)
-    checkpointer.save_ema_model(model, global_step)
-    ema_model.restore(model)
-    adaptive_grad_clipper.save(output_dir=f"{output_dir}/{checkpoint_prefix}{global_step:09d}")
-    save_rl_training_state(output_dir, global_step, completed_epochs)
+    log_on_main_process(logger, f"Saving final LoRA checkpoint at global_step {global_step}...")
     if hasattr(model, 'save_pretrained'):
         save_lora_checkpoint(model, output_dir, global_step)
+        ema_model.store(model)
+        ema_model.ema_copy_to_model(model)
+        save_lora_checkpoint(model, output_dir, global_step, suffix="-ema")
+        ema_model.restore(model)
+    adaptive_grad_clipper.save(output_dir=_lora_checkpoint_dir(output_dir, global_step))
+    save_rl_training_state(output_dir, global_step, completed_epochs)
 
     log_on_main_process(logger, f"""
     {'=' * 20}End RL Training (LoRA + FSDP2){'=' * 20}
