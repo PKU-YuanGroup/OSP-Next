@@ -1209,9 +1209,6 @@ If you find OSP-Next useful in your research, please consider citing:
 }
 ```
 
-> 🔁 The two `<ARXIV_ID>` placeholders (in `journal` and `eprint`) need to be
-> filled with the same arXiv number, e.g. `2606.12345`.
-
 Related work this project builds on:
 
 ```bibtex
