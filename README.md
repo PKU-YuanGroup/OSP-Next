@@ -14,7 +14,7 @@ A scalable **sparse** text-to-video diffusion model, introducing **Skiparse-2D A
 
 <h5 align="center">
 
-[![arXiv](https://img.shields.io/badge/Arxiv-OSP--Next-b31b1b.svg?logo=arXiv)](<ARXIV_URL>)
+[![arXiv](https://img.shields.io/badge/Arxiv-OSP--Next-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2605.28691)
 [![arXiv](https://img.shields.io/badge/Arxiv-Open--Sora%20Plan-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2412.00131)
 [![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace-FFD21E.svg)](https://huggingface.co/yunyangge/OSP-Next)
 [![ModelScope](https://img.shields.io/badge/ModelScope-OSP--Next-624AFF.svg?logo=alibabacloud)](https://modelscope.cn/models/beihai123/OSP-Next)
@@ -1198,15 +1198,14 @@ or open a pull request.
 If you find OSP-Next useful in your research, please consider citing:
 
 ```bibtex
-@article{ge2026ospnext,
-  title        = {OSP-Next: Efficient High-Quality Video Generation with Sparse Sequence Parallelism, HiF8 Quantization, and Reinforcement Learning},
-  author       = {Ge, Yunyang and He, Xianyi and Zhang, Zezhong and Lin, Bin and Zhu, Bin and Cheng, Xinhua and Yuan, Li},
-  journal      = {arXiv preprint arXiv:<ARXIV_ID>},
-  year         = {2026},
-  eprint       = {<ARXIV_ID>},
-  archivePrefix= {arXiv},
-  primaryClass = {cs.CV},
-  url          = {<ARXIV_URL>},
+@misc{ge2026ospnextefficienthighqualityvideo,
+      title={OSP-Next: Efficient High-Quality Video Generation with Sparse Sequence Parallelism, HiF8 Quantization, and Reinforcement Learning}, 
+      author={Yunyang Ge and Xianyi He and Zezhong Zhang and Bin Lin and Bin Zhu and Xinhua Cheng and Li Yuan},
+      year={2026},
+      eprint={2605.28691},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2605.28691}, 
 }
 ```
 
