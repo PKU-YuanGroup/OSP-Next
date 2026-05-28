@@ -33,7 +33,7 @@ A scalable **sparse** text-to-video diffusion model, introducing **Skiparse-2D A
 ## ✨ Highlights
 
 OSP-Next is a **sparse video diffusion** framework with four tightly co-designed
-contributions — see the [paper](<ARXIV_URL>) for the full technical report.
+contributions — see the [paper](https://arxiv.org/abs/2605.28691) for the full technical report.
 
 <table>
 <tr>
@@ -123,7 +123,7 @@ End-to-end speed-ups vs. the **Wan2.1** full-attention baseline, measured on
 
 > 🏆 &nbsp;OSP-Next hits a **VBench total of 83.73%** (Wan2.1 baseline: 83.69%);
 > OSP-Next-HiF8 keeps **83.29%** with only a 0.4-pt drop. Full benchmark tables,
-> ablations and qualitative comparisons are in the [paper](<ARXIV_URL>).
+> ablations and qualitative comparisons are in the [paper](https://arxiv.org/abs/2605.28691).
 
 > ℹ️ &nbsp;Multi-NPU 950PR numbers are not reported yet — Ascend 950PR
 > resources are currently in limited supply, so the results for this hardware
@@ -889,7 +889,7 @@ recent checkpoint folder under `output_dir`.
 
 > 🥇 &nbsp;**First RL pipeline for sparse video diffusion.** To the best of our
 > knowledge, OSP-Next is the first project to apply RL post-training directly to
-> a *sparse* video diffusion model — see the [paper](<ARXIV_URL>) for the
+> a *sparse* video diffusion model — see the [paper](https://arxiv.org/abs/2605.28691) for the
 > design rationale.
 
 The RL post-training uses the same FSDP2 backbone but trains a **LoRA** adapter
