@@ -215,14 +215,25 @@ class _AllGather(torch.autograd.Function):
         dim_sizes = ctx.dim_sizes
         rank = dist.get_rank(group)
 
-        offset = sum(dim_sizes[:rank])
-        grad_input = grad_outputs.narrow(dim, offset, dim_sizes[rank])
-
+        grad_outputs = contiguous(grad_outputs)
+        m = max(dim_sizes)
+        grad_chunks = []
+        for seg in torch.split(grad_outputs, dim_sizes, dim=dim):
+            pad_len = m - seg.size(dim)
+            if pad_len > 0:
+                pad_shape = list(seg.shape)
+                pad_shape[dim] = pad_len
+                seg = torch.cat([seg, seg.new_zeros(pad_shape)], dim=dim)
+            grad_chunks.append(contiguous(seg))
+        grad_input = torch.empty_like(grad_chunks[rank])
+        dist.reduce_scatter(grad_input, grad_chunks, op=dist.ReduceOp.SUM, group=group)
+        grad_input = grad_input.narrow(dim, 0, dim_sizes[rank])
         return contiguous(grad_input), None, None
 
 
 def all_gather(input_: torch.Tensor, dim: int = 1, group=None):
-    """Wrapper with cleaner interface."""
+    """All-gather with reduce-scatter backward (the true adjoint)."""
+
     return _AllGather.apply(input_, dim, group)
 
 
